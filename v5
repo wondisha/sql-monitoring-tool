@@ -3,28 +3,43 @@ GO
 SET QUOTED_IDENTIFIER ON
 GO
 
+-- Create error logging table if it doesn't exist
+IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE name = 'SQLBestPracticeMonitoringErrors')
+BEGIN
+    CREATE TABLE SQLBestPracticeMonitoringErrors (
+        InstanceID INT,
+        DBID INT,
+        DatabaseName SYSNAME,
+        BestPracticeName NVARCHAR(100),
+        ErrorMessage NVARCHAR(MAX),
+        ErrorLine INT,
+        LogTime DATETIME
+    );
+END
+GO
+
 ALTER PROCEDURE [dbo].[CheckSQLBestPractices]
 AS
 BEGIN
     SET NOCOUNT ON;
 
-    -- Debug logging table
+    -- Debug log for tracking execution
     DECLARE @DebugLog TABLE (LogMessage NVARCHAR(MAX), LogTime DATETIME);
+    INSERT INTO @DebugLog (LogMessage, LogTime) SELECT 'Starting SQL Best Practices Check', GETDATE();
 
     -- Instance-level variables
-    DECLARE @InstanceID INT, @DBID INT, @DBName NVARCHAR(128), @InstanceName NVARCHAR(100), @SQL NVARCHAR(MAX);
+    DECLARE @InstanceID INT, @DBID INT = 0, @DBName NVARCHAR(128) = 'InstanceLevel', @InstanceName NVARCHAR(100);
     DECLARE @RecommendedMaxDOP INT, @LogicalProcessorsPerNUMA INT, @NUMANodeCount INT, @TotalLogicalProcessors INT, @CurrentMaxDOP INT;
     DECLARE @CurrentCostThreshold INT, @RecommendedCostThreshold INT = 25;
     DECLARE @MaxServerMemory BIGINT, @MinServerMemory BIGINT, @TotalPhysicalMemory BIGINT;
     DECLARE @TempdbFileCount INT, @TempdbRecommendedFiles INT;
     DECLARE @LatestCompatLevel INT;
-
-    -- Log start of execution
-    INSERT INTO @DebugLog (LogMessage, LogTime) VALUES ('Starting SQL Best Practices Check', GETDATE());
+    DECLARE @SQL NVARCHAR(MAX);
 
     -- Retrieve a representative InstanceID and InstanceName
     SELECT TOP 1 @InstanceID = InstanceID, @InstanceName = Instance
     FROM Instances;
+    INSERT INTO @DebugLog (LogMessage, LogTime) SELECT 'Instance: ' + @InstanceName + ', InstanceID: ' + CAST(@InstanceID AS NVARCHAR(10)), GETDATE();
 
     -- Calculate recommended MaxDOP
     SELECT @NUMANodeCount = COUNT(DISTINCT node_id)
@@ -40,7 +55,7 @@ BEGIN
     -- Get Current MaxDOP
     SELECT @CurrentMaxDOP = CAST(value_in_use AS INT)
     FROM sys.configurations
-    WHERE Name = 'max degree of parallelism';
+    WHERE Name = 'Max degree of parallelism';
 
     -- Get Cost Threshold for Parallelism
     SELECT @CurrentCostThreshold = CAST(value_in_use AS INT)
@@ -80,16 +95,12 @@ BEGIN
     --- Instance-Level Checks
     -- ====================================================================================================
 
-    SET @DBID = 0;
-    SET @DBName = 'InstanceLevel';
+    INSERT INTO @DebugLog (LogMessage, LogTime) SELECT 'Starting instance-level checks', GETDATE();
 
     -- MaxDOP
-    INSERT INTO @DebugLog (LogMessage, LogTime) 
-    VALUES ('Checking MaxDOP: Current=' + CAST(@CurrentMaxDOP AS NVARCHAR(10)) + ', Recommended=' + CAST(@RecommendedMaxDOP AS NVARCHAR(10)), GETDATE());
-
     UPDATE SQLBestPracticeMonitoring
     SET Status = 'Resolved', 
-        CurrentValue = CAST(@CurrentMaxDOP AS NVARCHAR(255)), 
+        CurrentValue = CAST((SELECT value_in_use FROM sys.configurations WHERE Name = 'Max degree of parallelism') AS NVARCHAR(255)), 
         Notes = 'MaxDOP is set as recommended.', 
         ResolvedDate = GETDATE()
     WHERE InstanceID = @InstanceID
@@ -98,13 +109,9 @@ BEGIN
       AND Status = 'Unresolved'
       AND EXISTS (
           SELECT 1 FROM sys.configurations 
-          WHERE Name = 'max degree of parallelism' 
+          WHERE Name = 'Max degree of parallelism' 
           AND CAST(value_in_use AS INT) = @RecommendedMaxDOP
       );
-
-    INSERT INTO @DebugLog (LogMessage, LogTime) 
-    SELECT 'MaxDOP Updated: ' + CAST(@@ROWCOUNT AS NVARCHAR(10)) + ' rows', GETDATE()
-    WHERE @@ROWCOUNT > 0;
 
     INSERT INTO SQLBestPracticeMonitoring (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
     SELECT @InstanceID, @DBID, @InstanceName, @DBName, 'MaxDOP', 
@@ -114,7 +121,7 @@ BEGIN
            'MaxDOP should be set to ' + CAST(@RecommendedMaxDOP AS NVARCHAR(10)) + ' based on server configuration.'
     WHERE NOT EXISTS (
         SELECT 1 FROM sys.configurations 
-        WHERE Name = 'max degree of parallelism' 
+        WHERE Name = 'Max degree of parallelism' 
         AND CAST(value_in_use AS INT) = @RecommendedMaxDOP
     )
     AND NOT EXISTS (
@@ -123,13 +130,12 @@ BEGIN
     );
 
     INSERT INTO @DebugLog (LogMessage, LogTime) 
-    SELECT 'MaxDOP Inserted: ' + CAST(@@ROWCOUNT AS NVARCHAR(10)) + ' rows', GETDATE()
-    WHERE @@ROWCOUNT > 0;
+    SELECT 'MaxDOP Check: Updated ' + CAST(@@ROWCOUNT AS NVARCHAR(10)) + ' rows', GETDATE() WHERE @@ROWCOUNT > 0;
 
     -- Cost Threshold for Parallelism
     UPDATE SQLBestPracticeMonitoring
     SET Status = 'Resolved', 
-        CurrentValue = CAST(@CurrentCostThreshold AS NVARCHAR(255)), 
+        CurrentValue = CAST((SELECT value_in_use FROM sys.configurations WHERE name = 'cost threshold for parallelism') AS NVARCHAR(255)), 
         Notes = 'Cost threshold for parallelism is appropriately configured.', 
         ResolvedDate = GETDATE()
     WHERE InstanceID = @InstanceID
@@ -147,7 +153,7 @@ BEGIN
            CAST(@CurrentCostThreshold AS NVARCHAR(255)), 
            CAST(@RecommendedCostThreshold AS NVARCHAR(255)), 
            'Unresolved',
-           'Cost threshold for parallelism should be at least ' + CAST(@RecommendedCostThreshold AS NVARCHAR(10)) + ' for better performance.'
+           'Cost threshold for parallelism should be at least ' + CAST(@RecommendedCostThreshold AS NVARCHAR(10)) + '.'
     WHERE NOT EXISTS (
         SELECT 1 FROM sys.configurations 
         WHERE name = 'cost threshold for parallelism' 
@@ -161,7 +167,7 @@ BEGIN
     -- Max Server Memory
     UPDATE SQLBestPracticeMonitoring
     SET Status = 'Resolved', 
-        CurrentValue = CAST(@MaxServerMemory AS NVARCHAR(255)) + ' MB', 
+        CurrentValue = CAST((SELECT value_in_use FROM sys.configurations WHERE name = 'max server memory (MB)') AS NVARCHAR(255)) + ' MB', 
         Notes = 'Max server memory is properly configured.', 
         ResolvedDate = GETDATE()
     WHERE InstanceID = @InstanceID
@@ -195,21 +201,26 @@ BEGIN
     -- Tempdb Configuration
     UPDATE SQLBestPracticeMonitoring
     SET Status = 'Resolved', 
-        CurrentValue = CAST(@TempdbFileCount AS NVARCHAR(255)) + ' files', 
+        CurrentValue = CAST((SELECT COUNT(*) FROM sys.master_files WHERE database_id = DB_ID('tempdb') AND type = 0) AS NVARCHAR(255)) + ' files', 
         Notes = 'Tempdb has optimal number of data files.', 
         ResolvedDate = GETDATE()
     WHERE InstanceID = @InstanceID
       AND DBID = @DBID
       AND BestPracticeName = 'TempdbFileCount'
       AND Status = 'Unresolved'
-      AND @TempdbFileCount = @TempdbRecommendedFiles;
+      AND EXISTS (
+          SELECT 1 FROM sys.master_files 
+          WHERE database_id = DB_ID('tempdb') AND type = 0 
+          GROUP BY database_id 
+          HAVING COUNT(*) = @TempdbRecommendedFiles
+      );
 
     INSERT INTO SQLBestPracticeMonitoring (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
     SELECT @InstanceID, @DBID, @InstanceName, @DBName, 'TempdbFileCount', 
            CAST(@TempdbFileCount AS NVARCHAR(255)) + ' files', 
            CAST(@TempdbRecommendedFiles AS NVARCHAR(255)) + ' files', 
            'Unresolved',
-           'Tempdb should have ' + CAST(@TempdbRecommendedFiles AS NVARCHAR(10)) + ' data files (equal to CPU cores, max 8) for optimal performance.'
+           'Tempdb should have ' + CAST(@TempdbRecommendedFiles AS NVARCHAR(10)) + ' data files (equal to CPU cores, max 8).'
     WHERE @TempdbFileCount != @TempdbRecommendedFiles
       AND NOT EXISTS (
           SELECT 1 FROM SQLBestPracticeMonitoring
@@ -226,19 +237,25 @@ BEGIN
       AND DBID = @DBID
       AND BestPracticeName = 'InstantFileInitialization'
       AND Status = 'Unresolved'
-      AND EXISTS (SELECT 1 FROM sys.dm_server_services WHERE filename LIKE '%sqlservr.exe%' AND instant_file_initialization_enabled = 1);
+      AND EXISTS (
+          SELECT 1 FROM sys.dm_server_services 
+          WHERE filename LIKE '%sqlservr.exe%' AND instant_file_initialization_enabled = 1
+      );
 
     INSERT INTO SQLBestPracticeMonitoring (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
     SELECT @InstanceID, @DBID, @InstanceName, @DBName, 'InstantFileInitialization', 
            'Disabled', 
            'Enabled', 
            'Unresolved',
-           'Instant File Initialization (IFI) is disabled. Enable IFI for faster database creation, file growth, and restores.'
-    WHERE NOT EXISTS (SELECT 1 FROM sys.dm_server_services WHERE filename LIKE '%sqlservr.exe%' AND instant_file_initialization_enabled = 1)
-      AND NOT EXISTS (
-          SELECT 1 FROM SQLBestPracticeMonitoring
-          WHERE InstanceID = @InstanceID AND DBID = @DBID AND BestPracticeName = 'InstantFileInitialization' AND Status = 'Unresolved'
-      );
+           'Instant File Initialization (IFI) should be enabled for faster database operations.'
+    WHERE NOT EXISTS (
+        SELECT 1 FROM sys.dm_server_services 
+        WHERE filename LIKE '%sqlservr.exe%' AND instant_file_initialization_enabled = 1
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM SQLBestPracticeMonitoring
+        WHERE InstanceID = @InstanceID AND DBID = @DBID AND BestPracticeName = 'InstantFileInitialization' AND Status = 'Unresolved'
+    );
 
     -- Backup Compression Default
     UPDATE SQLBestPracticeMonitoring
@@ -250,19 +267,25 @@ BEGIN
       AND DBID = @DBID
       AND BestPracticeName = 'BackupCompressionDefault'
       AND Status = 'Unresolved'
-      AND EXISTS (SELECT 1 FROM sys.configurations WHERE name = 'backup compression default' AND CAST(value_in_use AS INT) = 1);
+      AND EXISTS (
+          SELECT 1 FROM sys.configurations 
+          WHERE name = 'backup compression default' AND CAST(value_in_use AS INT) = 1
+      );
 
     INSERT INTO SQLBestPracticeMonitoring (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
     SELECT @InstanceID, @DBID, @InstanceName, @DBName, 'BackupCompressionDefault', 
            'Disabled', 
            'Enabled', 
            'Unresolved',
-           'Backup compression default should be enabled to save disk space and speed up backup/restore operations.'
-    WHERE NOT EXISTS (SELECT 1 FROM sys.configurations WHERE name = 'backup compression default' AND CAST(value_in_use AS INT) = 1)
-      AND NOT EXISTS (
-          SELECT 1 FROM SQLBestPracticeMonitoring
-          WHERE InstanceID = @InstanceID AND DBID = @DBID AND BestPracticeName = 'BackupCompressionDefault' AND Status = 'Unresolved'
-      );
+           'Backup compression default should be enabled to save disk space.'
+    WHERE NOT EXISTS (
+        SELECT 1 FROM sys.configurations 
+        WHERE name = 'backup compression default' AND CAST(value_in_use AS INT) = 1
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM SQLBestPracticeMonitoring
+        WHERE InstanceID = @InstanceID AND DBID = @DBID AND BestPracticeName = 'BackupCompressionDefault' AND Status = 'Unresolved'
+    );
 
     -- Optimize for Ad hoc Workloads
     UPDATE SQLBestPracticeMonitoring
@@ -274,19 +297,25 @@ BEGIN
       AND DBID = @DBID
       AND BestPracticeName = 'OptimizeAdHocWorkloads'
       AND Status = 'Unresolved'
-      AND EXISTS (SELECT 1 FROM sys.configurations WHERE name = 'optimize for ad hoc workloads' AND CAST(value_in_use AS INT) = 1);
+      AND EXISTS (
+          SELECT 1 FROM sys.configurations 
+          WHERE name = 'optimize for ad hoc workloads' AND CAST(value_in_use AS INT) = 1
+      );
 
     INSERT INTO SQLBestPracticeMonitoring (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
     SELECT @InstanceID, @DBID, @InstanceName, @DBName, 'OptimizeAdHocWorkloads', 
            'Disabled', 
            'Enabled', 
            'Unresolved',
-           'Optimize for ad hoc workloads should be enabled to reduce plan cache bloat on busy OLTP servers.'
-    WHERE NOT EXISTS (SELECT 1 FROM sys.configurations WHERE name = 'optimize for ad hoc workloads' AND CAST(value_in_use AS INT) = 1)
-      AND NOT EXISTS (
-          SELECT 1 FROM SQLBestPracticeMonitoring
-          WHERE InstanceID = @InstanceID AND DBID = @DBID AND BestPracticeName = 'OptimizeAdHocWorkloads' AND Status = 'Unresolved'
-      );
+           'Optimize for ad hoc workloads should be enabled to reduce plan cache bloat.'
+    WHERE NOT EXISTS (
+        SELECT 1 FROM sys.configurations 
+        WHERE name = 'optimize for ad hoc workloads' AND CAST(value_in_use AS INT) = 1
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM SQLBestPracticeMonitoring
+        WHERE InstanceID = @InstanceID AND DBID = @DBID AND BestPracticeName = 'OptimizeAdHocWorkloads' AND Status = 'Unresolved'
+    );
 
     -- Remote Dedicated Admin Connection (DAC)
     UPDATE SQLBestPracticeMonitoring
@@ -298,19 +327,25 @@ BEGIN
       AND DBID = @DBID
       AND BestPracticeName = 'RemoteDAC'
       AND Status = 'Unresolved'
-      AND EXISTS (SELECT 1 FROM sys.configurations WHERE name = 'remote admin connections' AND CAST(value_in_use AS INT) = 1);
+      AND EXISTS (
+          SELECT 1 FROM sys.configurations 
+          WHERE name = 'remote admin connections' AND CAST(value_in_use AS INT) = 1
+      );
 
     INSERT INTO SQLBestPracticeMonitoring (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
     SELECT @InstanceID, @DBID, @InstanceName, @DBName, 'RemoteDAC', 
            'Disabled', 
            'Enabled', 
            'Unresolved',
-           'Remote Dedicated Admin Connection (DAC) should be enabled for critical troubleshooting access.'
-    WHERE NOT EXISTS (SELECT 1 FROM sys.configurations WHERE name = 'remote admin connections' AND CAST(value_in_use AS INT) = 1)
-      AND NOT EXISTS (
-          SELECT 1 FROM SQLBestPracticeMonitoring
-          WHERE InstanceID = @InstanceID AND DBID = @DBID AND BestPracticeName = 'RemoteDAC' AND Status = 'Unresolved'
-      );
+           'Remote Dedicated Admin Connection (DAC) should be enabled for troubleshooting.'
+    WHERE NOT EXISTS (
+        SELECT 1 FROM sys.configurations 
+        WHERE name = 'remote admin connections' AND CAST(value_in_use AS INT) = 1
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM SQLBestPracticeMonitoring
+        WHERE InstanceID = @InstanceID AND DBID = @DBID AND BestPracticeName = 'RemoteDAC' AND Status = 'Unresolved'
+    );
 
     -- SQL Server Agent Service Account
     UPDATE SQLBestPracticeMonitoring
@@ -319,8 +354,7 @@ BEGIN
         Notes = 'SQL Server Agent uses a non-LocalSystem account.', 
         ResolvedDate = GETDATE()
     FROM sys.dm_server_services s
-    WHERE s.filename LIKE '%sqlagent.exe%' 
-      AND s.service_account NOT LIKE '%LocalSystem%'
+    WHERE s.filename LIKE '%sqlagent.exe%' AND s.service_account NOT LIKE '%LocalSystem%'
       AND SQLBestPracticeMonitoring.InstanceID = @InstanceID
       AND SQLBestPracticeMonitoring.DBID = @DBID
       AND SQLBestPracticeMonitoring.BestPracticeName = 'SQLAgentAccount'
@@ -331,10 +365,9 @@ BEGIN
            s.service_account, 
            'Dedicated Domain Account', 
            'Unresolved',
-           'SQL Server Agent is running under ' + s.service_account + '. It should run under a dedicated, low-privileged domain account.'
+           'SQL Server Agent is running under ' + s.service_account + '. Use a dedicated, low-privileged domain account.'
     FROM sys.dm_server_services s
-    WHERE s.filename LIKE '%sqlagent.exe%' 
-      AND s.service_account LIKE '%LocalSystem%'
+    WHERE s.filename LIKE '%sqlagent.exe%' AND s.service_account LIKE '%LocalSystem%'
       AND NOT EXISTS (
           SELECT 1 FROM SQLBestPracticeMonitoring
           WHERE InstanceID = @InstanceID AND DBID = @DBID AND BestPracticeName = 'SQLAgentAccount' AND Status = 'Unresolved'
@@ -344,6 +377,9 @@ BEGIN
     --- Database-Level and Schema-Level Checks
     -- ====================================================================================================
 
+    INSERT INTO @DebugLog (LogMessage, LogTime) SELECT 'Starting database-level checks', GETDATE();
+
+    -- Cursor for database iteration (consider sp_MSforeachdb for performance in large environments)
     DECLARE db_cursor CURSOR LOCAL FAST_FORWARD FOR
     SELECT i.InstanceID, i.Instance, d.DBID, d.Name as DatabaseName
     FROM Instances i
@@ -356,7 +392,7 @@ BEGIN
     WHILE @@FETCH_STATUS = 0
     BEGIN
         BEGIN TRY
-            INSERT INTO @DebugLog (LogMessage, LogTime) VALUES ('Checking database: ' + @DBName, GETDATE());
+            INSERT INTO @DebugLog (LogMessage, Log annualeTime) SELECT 'Checking database: ' + @DBName, GETDATE();
 
             -- ========= DATABASE-LEVEL CHECKS =========
 
@@ -367,7 +403,7 @@ BEGIN
                 Notes = 'Auto Shrink is disabled.', 
                 ResolvedDate = GETDATE()
             FROM SQLBestPracticeMonitoring bpm
-            JOIN sys.databases d ON bpm.DBID = d.database_id
+            JOIN sys.databases d ON bpm張: bpm.DBID = d.database_id
             WHERE bpm.InstanceID = @InstanceID
               AND bpm.DBID = @DBID
               AND bpm.BestPracticeName = 'AutoShrink'
@@ -377,12 +413,9 @@ BEGIN
             INSERT INTO SQLBestPracticeMonitoring (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
             SELECT @InstanceID, @DBID, @InstanceName, @DBName, 'AutoShrink', 
                    CASE WHEN d.is_auto_shrink_on = 1 THEN 'Yes' ELSE 'No' END, 
-                   'No', 
-                   'Unresolved', 
-                   'Auto Shrink should be disabled for performance.'
+                   'No', 'Unresolved', 'Auto Shrink should be disabled for performance.'
             FROM sys.databases d
-            WHERE d.database_id = @DBID 
-              AND d.is_auto_shrink_on = 1
+            WHERE d.database_id = @DBID AND d.is_auto_shrink_on = 1
               AND NOT EXISTS (
                   SELECT 1 FROM SQLBestPracticeMonitoring
                   WHERE InstanceID = @InstanceID AND DBID = @DBID AND BestPracticeName = 'AutoShrink' AND Status = 'Unresolved'
@@ -405,12 +438,9 @@ BEGIN
             INSERT INTO SQLBestPracticeMonitoring (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
             SELECT @InstanceID, @DBID, @InstanceName, @DBName, 'AutoClose', 
                    CASE WHEN d.is_auto_close_on = 1 THEN 'Yes' ELSE 'No' END, 
-                   'No', 
-                   'Unresolved', 
-                   'Auto Close should be disabled for performance.'
+                   'No', 'Unresolved', 'Auto Close should be disabled for performance.'
             FROM sys.databases d
-            WHERE d.database_id = @DBID 
-              AND d.is_auto_close_on = 1
+            WHERE d.database_id = @DBID AND d.is_auto_close_on = 1
               AND NOT EXISTS (
                   SELECT 1 FROM SQLBestPracticeMonitoring
                   WHERE InstanceID = @InstanceID AND DBID = @DBID AND BestPracticeName = 'AutoClose' AND Status = 'Unresolved'
@@ -433,12 +463,9 @@ BEGIN
             INSERT INTO SQLBestPracticeMonitoring (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
             SELECT @InstanceID, @DBID, @InstanceName, @DBName, 'PageVerify', 
                    d.page_verify_option_desc, 
-                   'CHECKSUM', 
-                   'Unresolved', 
-                   'Page Verify should be set to CHECKSUM for data integrity.'
+                   'CHECKSUM', 'Unresolved', 'Page Verify should be set to CHECKSUM for data integrity.'
             FROM sys.databases d
-            WHERE d.database_id = @DBID 
-              AND d.page_verify_option_desc != 'CHECKSUM'
+            WHERE d.database_id = @DBID AND d.page_verify_option_desc != 'CHECKSUM'
               AND NOT EXISTS (
                   SELECT 1 FROM SQLBestPracticeMonitoring
                   WHERE InstanceID = @InstanceID AND DBID = @DBID AND BestPracticeName = 'PageVerify' AND Status = 'Unresolved'
@@ -452,21 +479,20 @@ BEGIN
                 ResolvedDate = GETDATE()
             FROM SQLBestPracticeMonitoring bpm
             JOIN sys.databases d ON bpm.DBID = d.database_id
+            JOIN sys.databases master_db ON master_db.database_id = DB_ID('master')
             WHERE bpm.InstanceID = @InstanceID
               AND bpm.DBID = @DBID
               AND bpm.BestPracticeName = 'CollationDifference'
-              AND d.collation_name = SERVERPROPERTY('Collation')
+              AND d.collation_name = master_db.collation_name
               AND bpm.Status = 'Unresolved';
 
             INSERT INTO SQLBestPracticeMonitoring (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
             SELECT @InstanceID, @DBID, @InstanceName, @DBName, 'CollationDifference', 
-                   CASE WHEN d.collation_name != SERVERPROPERTY('Collation') THEN 'Yes' ELSE 'No' END, 
-                   'No', 
-                   'Unresolved', 
-                   'Database collation should match server collation to avoid issues.'
+                   'Yes', 
+                   'No', 'Unresolved', 'Database collation should match server collation.'
             FROM sys.databases d
-            WHERE d.database_id = @DBID 
-              AND d.collation_name != SERVERPROPERTY('Collation')
+            JOIN sys.databases master_db ON master_db.database_id = DB_ID('master')
+            WHERE d.database_id = @DBID AND d.collation_name != master_db.collation_name
               AND NOT EXISTS (
                   SELECT 1 FROM SQLBestPracticeMonitoring
                   WHERE InstanceID = @InstanceID AND DBID = @DBID AND BestPracticeName = 'CollationDifference' AND Status = 'Unresolved'
@@ -489,12 +515,9 @@ BEGIN
             INSERT INTO SQLBestPracticeMonitoring (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
             SELECT @InstanceID, @DBID, @InstanceName, @DBName, 'RecoveryModel', 
                    d.recovery_model_desc, 
-                   'FULL', 
-                   'Unresolved', 
-                   'Recovery Model should be FULL for production databases.'
+                   'FULL', 'Unresolved', 'Recovery Model should be FULL for production databases.'
             FROM sys.databases d
-            WHERE d.database_id = @DBID 
-              AND d.recovery_model_desc != 'FULL'
+            WHERE d.database_id = @DBID AND d.recovery_model_desc != 'FULL'
               AND d.name NOT IN ('master', 'model', 'msdb', 'tempdb')
               AND NOT EXISTS (
                   SELECT 1 FROM SQLBestPracticeMonitoring
@@ -518,13 +541,9 @@ BEGIN
             INSERT INTO SQLBestPracticeMonitoring (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
             SELECT @InstanceID, @DBID, @InstanceName, @DBName, 'Trustworthy', 
                    CASE WHEN d.is_trustworthy_on = 1 THEN 'Yes' ELSE 'No' END, 
-                   'No', 
-                   'Unresolved', 
-                   'Trustworthy should be OFF unless required for security.'
+                   'No', 'Unresolved', 'Trustworthy should be OFF unless required.'
             FROM sys.databases d
-            WHERE d.database_id = @DBID 
-              AND d.is_trustworthy_on = 1 
-              AND d.name != 'msdb'
+            WHERE d.database_id = @DBID AND d.is_trustworthy_on = 1 AND d.name != 'msdb'
               AND NOT EXISTS (
                   SELECT 1 FROM SQLBestPracticeMonitoring
                   WHERE InstanceID = @InstanceID AND DBID = @DBID AND BestPracticeName = 'Trustworthy' AND Status = 'Unresolved'
@@ -547,12 +566,10 @@ BEGIN
             INSERT INTO SQLBestPracticeMonitoring (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
             SELECT @InstanceID, @DBID, @InstanceName, @DBName, 'TargetRecoveryTime', 
                    CAST(d.target_recovery_time_in_seconds AS NVARCHAR(255)) + ' seconds', 
-                   '60 seconds', 
-                   'Unresolved',
-                   'Target Recovery Time should be 60 seconds or less for faster database recovery.'
+                   '60 seconds', 'Unresolved',
+                   'Target Recovery Time should be 60 seconds or less.'
             FROM sys.databases d
-            WHERE d.database_id = @DBID 
-              AND d.target_recovery_time_in_seconds > 60
+            WHERE d.database_id = @DBID AND d.target_recovery_time_in_seconds > 60
               AND NOT EXISTS (
                   SELECT 1 FROM SQLBestPracticeMonitoring
                   WHERE InstanceID = @InstanceID AND DBID = @DBID AND BestPracticeName = 'TargetRecoveryTime' AND Status = 'Unresolved'
@@ -568,46 +585,44 @@ BEGIN
             JOIN sys.databases d ON bpm.DBID = d.database_id
             WHERE bpm.InstanceID = @InstanceID
               AND bpm.DBID = @DBID
-              AND bpm.BestPracticeName = 'AutoCreateStatsAsync'
-              AND d.is_auto_create_stats_on = 1 
-              AND d.is_auto_update_stats_async_on = 1
+              AND bpm.B resurfacedPracticeName = 'AutoCreateStatsAsync'
+             ytuc: AND d.is_auto_create_stats_on = 1 AND d.is_auto_update_stats_async_on = 1
               AND bpm.Status = 'Unresolved';
 
             INSERT INTO SQLBestPracticeMonitoring (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
             SELECT @InstanceID, @DBID, @InstanceName, @DBName, 'AutoCreateStatsAsync',
                    'Create: ' + CASE WHEN d.is_auto_create_stats_on = 1 THEN 'On' ELSE 'Off' END +
                    ', Update Async: ' + CASE WHEN d.is_auto_update_stats_async_on = 1 THEN 'On' ELSE 'Off' END,
-                   'Create: On, Update Async: On', 
-                   'Unresolved',
-                   'Auto Create/Update Statistics Async should be enabled for optimal query performance.'
+                   'Create: On, Update Async: On', 'Unresolved',
+                   'Auto Create/Update Statistics Async should be enabled.'
             FROM sys.databases d
-            WHERE d.database_id = @DBID 
-              AND (d.is_auto_create_stats_on = 0 OR d.is_auto_update_stats_async_on = 0)
+            WHERE d.database_id = @DBID AND (d.is_auto_create_stats_on = 0 OR d.is_auto_update_stats_async_on = 0)
               AND NOT EXISTS (
                   SELECT 1 FROM SQLBestPracticeMonitoring
                   WHERE InstanceID = @InstanceID AND DBID = @DBID AND BestPracticeName = 'AutoCreateStatsAsync' AND Status = 'Unresolved'
               );
 
-            -- ========= SCHEMA-LEVEL CHECKS (Dynamic SQL) =========
+            -- ========= SCHEMA-LEVEL CHECKS =========
             IF @DBName NOT IN ('master', 'model', 'msdb', 'tempdb')
             BEGIN
                 SET @SQL = '
-                USE [' + QUOTENAME(@DBName) + '];
+                USE [' + @DBName + '];
 
                 -- Auto-Growth Settings
                 UPDATE bpm
                 SET Status = ''Resolved'', 
-                    CurrentValue = CASE WHEN f.is_percent_growth = 1 THEN CAST(f.growth AS NVARCHAR(10)) + ''%'' 
-                                       ELSE CAST(f.growth * 8 / 1024 AS NVARCHAR(10)) + '' MB'' END,
                     Notes = ''Auto-growth settings optimized.'', 
-                    ResolvedDate = GETDATE()
+                    ResolvedDate = GETDATE(),
+                    CurrentValue = CASE WHEN f.is_percent_growth = 1 THEN CAST(f.growth AS NVARCHAR(10)) + ''%''
+                                        ELSE CAST(f.growth * 8 / 1024 AS NVARCHAR(10)) + '' MB'' END
                 FROM SQLBestPracticeMonitoring bpm
                 JOIN sys.master_files f ON (
-                    (bpm.ObjectName = ''Data: '' + f.name AND f.type = 0) OR 
-                    (bpm.ObjectName = ''Log: '' + f.name AND f.type = 1)
+                    (bpm.ObjectName = ''Data: '' + f.name AND f.type = 0) OR
+                    (bpm.ObjectName = ''Log: '' + f
+
+.name AND f.type = 1)
                 )
-                WHERE bpm.InstanceID = @InstanceID 
-                  AND bpm.DBID = @DBID
+                WHERE bpm.InstanceID = @InstanceID AND bpm.DBID = @DBID
                   AND bpm.BestPracticeName = ''AutoGrowthSettings''
                   AND bpm.Status = ''Unresolved''
                   AND f.database_id = DB_ID()
@@ -617,7 +632,7 @@ BEGIN
                 INSERT INTO SQLBestPracticeMonitoring (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, ObjectName, CurrentValue, RecommendedValue, Status, Notes)
                 SELECT @InstanceID, @DBID, @InstanceName, @DBName, ''AutoGrowthSettings'',
                        CASE WHEN f.type = 0 THEN ''Data: '' + f.name ELSE ''Log: '' + f.name END,
-                       CASE WHEN f.is_percent_growth = 1 THEN CAST(f.growth AS NVARCHAR(10)) + ''%'' 
+                       CASE WHEN f.is_percent_growth = 1 THEN CAST(f.growth AS NVARCHAR(10)) + ''%''
                             ELSE CAST(f.growth * 8 / 1024 AS NVARCHAR(10)) + '' MB'' END,
                        CASE WHEN f.type = 0 THEN ''Fixed MB (100+ MB)'' ELSE ''Fixed MB (10+ MB)'' END,
                        ''Unresolved'',
@@ -631,14 +646,11 @@ BEGIN
                        OR (f.type = 0 AND f.growth * 8 / 1024 < 100)
                        OR (f.type = 1 AND f.growth * 8 / 1024 < 10))
                   AND f.growth > 0
-                  AND NOT EXISTS (
-                      SELECT 1 FROM SQLBestPracticeMonitoring bpm
-                      WHERE bpm.InstanceID = @InstanceID 
-                        AND bpm.DBID = @DBID
-                        AND bpm.BestPracticeName = ''AutoGrowthSettings''
-                        AND bpm.ObjectName = CASE WHEN f.type = 0 THEN ''Data: '' + f.name ELSE ''Log: '' + f.name END
-                        AND bpm.Status = ''Unresolved''
-                  );
+                  AND NOT EXISTS (SELECT 1 FROM SQLBestPracticeMonitoring bpm
+                                  WHERE bpm.InstanceID = @InstanceID AND bpm.DBID = @DBID
+                                    AND bpm.BestPracticeName = ''AutoGrowthSettings''
+                                    AND bpm.ObjectName = CASE WHEN f.type = 0 THEN ''Data: '' + f.name ELSE ''Log: '' + f.name END
+                                    AND bpm.Status = ''Unresolved'');
 
                 -- Database Compatibility Level
                 DECLARE @CurrentCompatLevel INT;
@@ -650,8 +662,7 @@ BEGIN
                     Notes = ''Compatibility level is current.'', 
                     ResolvedDate = GETDATE()
                 FROM SQLBestPracticeMonitoring bpm
-                WHERE bpm.InstanceID = @InstanceID 
-                  AND bpm.DBID = @DBID
+                WHERE bpm.InstanceID = @InstanceID AND bpm.DBID = @DBID
                   AND bpm.BestPracticeName = ''CompatibilityLevel''
                   AND bpm.Status = ''Unresolved''
                   AND @CurrentCompatLevel >= @LatestCompatLevel;
@@ -661,4 +672,688 @@ BEGIN
                        CAST(@CurrentCompatLevel AS NVARCHAR(10)), 
                        CAST(@LatestCompatLevel AS NVARCHAR(10)), 
                        ''Unresolved'',
-                       ''Database compatibility level should
+                       ''Database compatibility level should be updated to latest version.''
+                WHERE @CurrentCompatLevel < @LatestCompatLevel
+                  AND NOT EXISTS (SELECT 1 FROM SQLBestPracticeMonitoring bpm
+                                  WHERE bpm.InstanceID = @InstanceID AND bpm.DBID = @DBID
+                                    AND bpm.BestPracticeName = ''CompatibilityLevel'' AND bpm.Status = ''Unresolved'');
+
+                -- Auto-Update Statistics
+                UPDATE bpm
+                SET Status = ''Resolved'', 
+                    CurrentValue = ''Enabled'',
+                    Notes = ''Auto-update statistics is enabled.'', 
+                    ResolvedDate = GETDATE()
+                FROM SQLBestPracticeMonitoring bpm
+                WHERE bpm.InstanceID = @InstanceID AND bpm.DBID = @DBID
+                  AND bpm.BestPracticeName = ''AutoUpdateStatistics''
+                  AND bpm.Status = ''Unresolved''
+                  AND EXISTS (SELECT 1 FROM sys.databases WHERE name = DB_NAME() AND is_auto_update_stats_on = 1);
+
+                INSERT INTO SQLBestPracticeMonitoring (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+                SELECT @InstanceID, @DBID, @InstanceName, @DBName, ''AutoUpdateStatistics'',
+                       CASE WHEN is_auto_update_stats_on = 1 THEN ''Enabled'' ELSE ''Disabled'' END,
+                       ''Enabled'', ''Unresolved'',
+                       ''Auto-update statistics should be enabled for optimal query performance.''
+                FROM sys.databases
+                WHERE name = DB_NAME() AND is_auto_update_stats_on = 0
+                  AND NOT EXISTS (SELECT 1 FROM SQLBestPracticeMonitoring bpm
+                                  WHERE bpm.InstanceID = @InstanceID AND bpm.DBID = @DBID
+                                    AND bpm.BestPracticeName = ''AutoUpdateStatistics'' AND bpm.Status = ''Unresolved'');
+
+                -- LEGACY_CARDINALITY_ESTIMATION
+                UPDATE SQLBestPracticeMonitoring
+                SET Status = ''Resolved'', 
+                    CurrentValue = ''OFF'', 
+                    Notes = ''LEGACY_CARDINALITY_ESTIMATION is OFF.'', 
+                    ResolvedDate = GETDATE()
+                WHERE InstanceID = @InstanceID
+                  AND DBID = @DBID
+                  AND BestPracticeName = ''LegacyCardinalityEstimation''
+                  AND EXISTS (SELECT 1 FROM sys.database_scoped_configurations WHERE name = ''LEGACY_CARDINALITY_ESTIMATION'' AND CAST(value AS BIT) = 0)
+                  AND Status = ''Unresolved'';
+
+                INSERT INTO SQLBestPracticeMonitoring (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+                SELECT @InstanceID, @DBID, @InstanceName, @DBName, ''LegacyCardinalityEstimation'', 
+                       CAST(value AS NVARCHAR(10)), 
+                       ''OFF'', ''Unresolved'',
+                       ''LEGACY_CARDINALITY_ESTIMATION should be OFF for modern query optimizer benefits.''
+                FROM sys.database_scoped_configurations
+                WHERE name = ''LEGACY_CARDINALITY_ESTIMATION'' AND CAST(value AS BIT) = 1
+                  AND NOT EXISTS (
+                      SELECT 1 FROM SQLBestPracticeMonitoring
+                      WHERE InstanceID = @InstanceID AND DBID = @DBID AND BestPracticeName = ''LegacyCardinalityEstimation'' AND Status = ''Unresolved''
+                  );
+
+                -- Recent Backup
+                UPDATE bpm
+                SET Status = ''Resolved'', 
+                    Notes = ''Recent backup found.'', 
+                    ResolvedDate = GETDATE(),
+                    CurrentValue = CAST(DATEDIFF(day, bs.backup_finish_date, GETDATE()) AS NVARCHAR(10)) + '' days ago''
+                FROM SQLBestPracticeMonitoring bpm
+                JOIN sys.databases d ON bpm.DBID = d.database_id
+                LEFT JOIN (SELECT database_name, MAX(backup_finish_date) as backup_finish_date
+                           FROM msdb.dbo.backupset
+                           WHERE type = ''D''
+                           GROUP BY database_name) bs ON d.name = bs.database_name
+                WHERE bpm.InstanceID = @InstanceID AND bpm.DBID = @DBID
+                  AND bpm.BestPracticeName = ''RecentBackup''
+                  AND bpm.Status = ''Unresolved''
+                  AND DATEDIFF(day, bs.backup_finish_date, GETDATE()) <= 7;
+
+                INSERT INTO SQLBestPracticeMonitoring (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+                SELECT @InstanceID, @DBID, @InstanceName, @DBName, ''RecentBackup'',
+                       CASE WHEN bs.backup_finish_date IS NULL THEN ''Never''
+                            ELSE CAST(DATEDIFF(day, bs.backup_finish_date, GETDATE()) AS NVARCHAR(10)) + '' days ago'' END,
+                       ''Within 7 days'', ''Unresolved'',
+                       CASE WHEN bs.backup_finish_date IS NULL THEN ''Database has never been backed up.''
+                            ELSE ''Last full backup was '' + CAST(DATEDIFF(day, bs.backup_finish_date, GETDATE()) AS NVARCHAR(10)) + '' days ago.'' END
+                FROM sys.databases d
+                LEFT JOIN (SELECT database_name, MAX(backup_finish_date) as backup_finish_date
+                           FROM msdb.dbo.backupset
+                           WHERE type = ''D''
+                           GROUP BY database_name) bs ON d.name = bs.database_name
+                WHERE d.name = DB_NAME()
+                  AND (bs.backup_finish_date IS NULL OR DATEDIFF(day, bs.backup_finish_date, GETDATE()) > 7)
+                  AND NOT EXISTS (SELECT 1 FROM SQLBestPracticeMonitoring bpm
+                                  WHERE bpm.InstanceID = @InstanceID AND bpm.DBID = @DBID
+                                    AND bpm.BestPracticeName = ''RecentBackup'' AND bpm.Status = ''Unresolved'');
+
+                -- Log Backup Frequency
+                UPDATE bpm
+                SET Status = ''Resolved'', 
+                    Notes = ''Recent log backup found.'', 
+                    ResolvedDate = GETDATE(),
+                    CurrentValue = CAST(DATEDIFF(hour, bs.backup_finish_date, GETDATE()) AS NVARCHAR(10)) + '' hours ago''
+                FROM SQLBestPracticeMonitoring bpm
+                JOIN sys.databases d ON bpm.DBID = d.database_id
+                LEFT JOIN (SELECT database_name, MAX(backup_finish_date) as backup_finish_date
+                           FROM msdb.dbo.backupset
+                           WHERE type = ''L''
+                           GROUP BY database_name) bs ON d.name = bs.database_name
+                WHERE bpm.InstanceID = @InstanceID AND bpm.DBID = @DBID
+                  AND bpm.BestPracticeName = ''LogBackupFrequency''
+                  AND bpm.Status = ''Unresolved''
+                  AND d.recovery_model_desc = ''FULL''
+                  AND DATEDIFF(hour, bs.backup_finish_date, GETDATE()) <= 4;
+
+                INSERT INTO SQLBestPracticeMonitoring (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+                SELECT @InstanceID, @DBID, @InstanceName, @DBName, ''LogBackupFrequency'',
+                       CASE WHEN bs.backup_finish_date IS NULL THEN ''Never''
+                            ELSE CAST(DATEDIFF(hour, bs.backup_finish_date, GETDATE()) AS NVARCHAR(10)) + '' hours ago'' END,
+                       ''Within 4 hours'', ''Unresolved'',
+                       ''FULL recovery model databases should have log backups every 4 hours or less.''
+                FROM sys.databases d
+                LEFT JOIN (SELECT database_name, MAX(backup_finish_date) as backup_finish_date
+                           FROM msdb.dbo.backupset
+                           WHERE type = ''L''
+                           GROUP BY database_name) bs ON d.name = bs.database_name
+                WHERE d.name = DB_NAME()
+                  AND d.recovery_model_desc = ''FULL''
+                  AND (bs.backup_finish_date IS NULL OR DATEDIFF(hour, bs.backup_finish_date, GETDATE()) > 4)
+                  AND NOT EXISTS (SELECT 1 FROM SQLBestPracticeMonitoring bpm
+                                  WHERE bpm.InstanceID = @InstanceID AND bpm.DBID = @DBID
+                                    AND bpm.BestPracticeName = ''LogBackupFrequency'' AND bpm.Status = ''Unresolved'');
+
+                -- Table Naming
+                UPDATE bpm
+                SET Status = ''Resolved'', 
+                    Notes = ''Table name matches best practice.'', 
+                    ResolvedDate = GETDATE(),
+                    CurrentValue = t.name
+                FROM SQLBestPracticeMonitoring bpm
+                JOIN sys.tables t ON bpm.ObjectName = t.name AND bpm.DBID = DB_ID()
+                WHERE bpm.InstanceID = @InstanceID AND bpm.DBID = @DBID 
+                  AND bpm.BestPracticeName = ''TableNaming'' 
+                  AND bpm.Status = ''Unresolved''
+                  AND t.name NOT LIKE ''%[^a-zA-Z0-9_]%'' AND t.name LIKE ''[a-zA-Z]%'';
+
+                INSERT INTO SQLBestPracticeMonitoring (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, ObjectName, CurrentValue, RecommendedValue, Status, Notes)
+                SELECT @InstanceID, @DBID, @InstanceName, @DBName, ''TableNaming'', 
+                       t.name, 
+                       t.name, 
+                       ''No spaces or special chars; Start with letter'', ''Unresolved'', 
+                       ''Table name should not contain spaces or special characters and should start with a letter.''
+                FROM sys.tables t
+                WHERE (t.name LIKE ''%[^a-zA-Z0-9_]%'' OR t.name NOT LIKE ''[a-zA-Z]%'')
+                  AND NOT EXISTS (SELECT 1 FROM SQLBestPracticeMonitoring bpm 
+                                  WHERE bpm.InstanceID = @InstanceID AND bpm.DBID = @DBID 
+                                    AND bpm.BestPracticeName = ''TableNaming'' 
+                                    AND bpm.ObjectName = t.name 
+                                    AND bpm.Status = ''Unresolved'');
+
+                -- Deprecated Data Types
+                UPDATE bpm
+                SET Status = ''Resolved'', 
+                    Notes = ''Column data type is now supported.'', 
+                    CurrentValue = TYPE_NAME(c.system_type_id), 
+                    ResolvedDate = GETDATE()
+                FROM SQLBestPracticeMonitoring bpm
+                JOIN sys.tables t ON LEFT(bpm.ObjectName, CHARINDEX(''.'', bpm.ObjectName + ''.'') - 1) = t.name AND bpm.DBID = DB_ID()
+                JOIN sys.columns c ON t.object_id = c.object_id AND RIGHT(bpm.ObjectName, LEN(bpm.ObjectName) - CHARINDEX(''.'', bpm.ObjectName + ''.'')) = c.name
+                WHERE bpm.InstanceID = @InstanceID AND bpm.DBID = @DBID 
+                  AND bpm.BestPracticeName = ''DeprecatedDataType'' 
+                  AND bpm.Status = ''Unresolved'' 
+                  AND TYPE_NAME(c.system_type_id) NOT IN (''ntext'', ''text'', ''image'');
+
+                INSERT INTO SQLBestPracticeMonitoring (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, ObjectName, CurrentValue, RecommendedValue, Status, Notes)
+                SELECT @InstanceID, @DBID, @InstanceName, @DBName, ''DeprecatedDataType'', 
+                       t.name + ''.'' + c.name, 
+                       TYPE_NAME(c.system_type_id), 
+                       ''NVARCHAR(MAX)/VARBINARY(MAX)'', ''Unresolved'', 
+                       ''Deprecated data type (NTEXT/TEXT/IMAGE) should be replaced.''
+                FROM sys.tables t
+                JOIN sys.columns c ON t.object_id = c.object_id
+                WHERE TYPE_NAME(c.system_type_id) IN (''ntext'', ''text'', ''image'')
+                  AND NOT EXISTS (SELECT 1 FROM SQLBestPracticeMonitoring bpm 
+                                  WHERE bpm.InstanceID = @InstanceID AND bpm.DBID = @DBID 
+                                    AND bpm.BestPracticeName = ''DeprecatedDataType'' 
+                                    AND bpm.ObjectName = t.name + ''.'' + c.name 
+                                    AND bpm.Status = ''Unresolved'');
+
+                -- Missing Primary Key
+                UPDATE bpm
+                SET Status = ''Resolved'', 
+                    Notes = ''Table now has a primary key.'', 
+                    CurrentValue = ''Exists'', 
+                    ResolvedDate = GETDATE()
+                FROM SQLBestPracticeMonitoring bpm
+                JOIN sys.tables t ON bpm.ObjectName = t.name AND bpm.DBID = DB_ID()
+                WHERE bpm.InstanceID = @InstanceID AND bpm.DBID = @DBID 
+                  AND bpm.BestPracticeName = ''MissingPrimaryKey'' 
+                  AND bpm.Status = ''Unresolved'' 
+                  AND EXISTS (
+                      SELECT 1 FROM sys.indexes i 
+                      WHERE i.object_id = t.object_id AND i.is_primary_key = 1
+                  );
+
+                INSERT INTO SQLBestPracticeMonitoring (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, ObjectName, CurrentValue, RecommendedValue, Status, Notes)
+                SELECT @InstanceID, @DBID, @InstanceName, @DBName, ''MissingPrimaryKey'', 
+                       t.name, 
+                       ''None'', 
+                       ''Add a Primary Key'', ''Unresolved'', 
+                       ''Tables should have a primary key.''
+                FROM sys.tables t
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM sys.indexes i 
+                    WHERE i.object_id = t.object_id AND i.is_primary_key = 1
+                )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM SQLBestPracticeMonitoring bpm 
+                      WHERE bpm.InstanceID = @InstanceID AND bpm.DBID = @DBID 
+                        AND bpm.BestPracticeName = ''MissingPrimaryKey'' 
+                        AND bpm.ObjectName = t.name 
+                        AND bpm.Status = ''Unresolved''
+                  );
+
+                -- Heaps
+                UPDATE bpm
+                SET Status = ''Resolved'', 
+                    Notes = ''Table now has a clustered index.'', 
+                    CurrentValue = ''Clustered Index Exists'', 
+                    ResolvedDate = GETDATE()
+                FROM SQLBestPracticeMonitoring bpm
+                JOIN sys.tables t ON bpm.ObjectName = t.name AND bpm.DBID = DB_ID()
+                WHERE bpm.InstanceID = @InstanceID AND bpm.DBID = @DBID 
+                  AND bpm.BestPracticeName = ''HeapTable'' 
+                  AND bpm.Status = ''Unresolved''
+                  AND EXISTS (
+                      SELECT 1 FROM sys.indexes i 
+                      WHERE i.object_id = t.object_id AND i.type = 1
+                  );
+
+                INSERT INTO SQLBestPracticeMonitoring (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, ObjectName, CurrentValue, RecommendedValue, Status, Notes)
+                SELECT @InstanceID, @DBID, @InstanceName, @DBName, ''HeapTable'', 
+                       t.name, 
+                       ''Heap'', 
+                       ''Clustered Index'', ''Unresolved'', 
+                       ''Table is a heap; consider adding a clustered index.''
+                FROM sys.tables t
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM sys.indexes i 
+                    WHERE i.object_id = t.object_id AND i.type = 1
+                )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM SQLBestPracticeMonitoring bpm 
+                      WHERE bpm.InstanceID = @InstanceID AND bpm.DBID = @DBID 
+                        AND bpm.BestPracticeName = ''HeapTable'' 
+                        AND bpm.ObjectName = t.name 
+                        AND bpm.Status = ''Unresolved''
+                  );
+
+                -- Untrusted Foreign Keys
+                UPDATE bpm
+                SET Status = ''Resolved'', 
+                    Notes = ''Foreign key is now trusted.'', 
+                    CurrentValue = ''Trusted'', 
+                    ResolvedDate = GETDATE()
+                FROM SQLBestPracticeMonitoring bpm
+                JOIN sys.foreign_keys fk ON bpm.ObjectName = OBJECT_SCHEMA_NAME(fk.parent_object_id) + ''.'' + OBJECT_NAME(fk.parent_object_id) + ''.'' + fk.name AND bpm.DBID = DB_ID()
+                WHERE bpm.InstanceID = @InstanceID AND bpm.DBID = @DBID 
+                  AND bestPracticeName = ''UntrustedForeignKey'' 
+                  AND bpm.Status = ''Unresolved''
+                  AND fk.is_not_trusted = 0;
+
+                INSERT INTO SQLBestPracticeMonitoring (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, ObjectName, CurrentValue, RecommendedValue, Status, Notes)
+                SELECT @InstanceID, @DBID, @InstanceName, @DBName, ''UntrustedForeignKey'',
+                       OBJECT_SCHEMA_NAME(fk.parent_object_id) + ''.'' + OBJECT_NAME(fk.parent_object_id) + ''.'' + fk.name,
+                       ''Untrusted'', ''Trusted'', ''Unresolved'',
+                       ''Foreign key is untrusted and should be rebuilt with CHECK.''
+                FROM sys.foreign_keys fk
+                WHERE fk.is_not_trusted = 1
+                  AND NOT EXISTS (
+                      SELECT 1 FROM SQLBestPracticeMonitoring bpm 
+                      WHERE bpm.InstanceID = @InstanceID AND bpm.DBID = @DBID 
+                        AND bpm.BestPracticeName = ''UntrustedForeignKey'' 
+                        AND bpm.ObjectName = OBJECT_SCHEMA_NAME(fk.parent_object_id) + ''.'' + OBJECT_NAME(fk.parent_object_id) + ''.'' + fk.name 
+                        AND bpm.Status = ''Unresolved''
+                  );
+
+                -- Index Fragmentation
+                UPDATE bpm
+                SET Status = ''Resolved'', 
+                    Notes = ''Index fragmentation is within acceptable limits.'', 
+                    ResolvedDate = GETDATE(),
+                    CurrentValue = CAST(ROUND(f.avg_fragmentation_in_percent, 2) AS NVARCHAR(10)) + ''%''
+                FROM SQLBestPracticeMonitoring bpm
+                JOIN sys.indexes i ON RIGHT(bpm.ObjectName, LEN(bpm.ObjectName) - CHARINDEX(''.'', bpm.ObjectName + ''.'') ) = i.name AND bpm.DBID = DB_ID()
+                JOIN sys.tables t ON LEFT(bpm.ObjectName, CHARINDEX(''.'', bpm.ObjectName + ''.'') - 1) = t.name AND i.object_id = t.object_id
+                JOIN sys.dm_db_index_physical_stats(DB_ID(), NULL, NULL, NULL, ''LIMITED'') f
+                    ON f.object_id = i.object_id AND f.index_id = i.index_id
+                WHERE bpm.InstanceID = @InstanceID AND bpm.DBID = @DBID 
+                  AND bpm.BestPracticeName = ''IndexFragmentation'' 
+                  AND bpm.Status = ''Unresolved''
+                  AND f.avg_fragmentation_in_percent <= 30;
+
+                INSERT INTO SQLBestPracticeMonitoring (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, ObjectName, CurrentValue, RecommendedValue, Status, Notes)
+                SELECT @InstanceID, @DBID, @InstanceName, @DBName, ''IndexFragmentation'',
+                       t.name + ''.'' + i.name,
+                       CAST(ROUND(f.avg_fragmentation_in_percent, 2) AS NVARCHAR(10)) + ''%'',
+                       ''< 30%'', ''Unresolved'',
+                       ''Index fragmentation is '' + CAST(ROUND(f.avg_fragmentation_in_percent, 2) AS NVARCHAR(10)) + ''%. Consider rebuilding or reorganizing.''
+                FROM sys.dm_db_index_physical_stats(DB_ID(), NULL, NULL, NULL, ''LIMITED'') f
+                JOIN sys.indexes i ON f.object_id = i.object_id AND f.index_id = i.index_id
+                JOIN sys.tables t ON i.object_id = t.object_id
+                WHERE f.avg_fragmentation_in_percent > 30
+                  AND f.page_count > 1000
+                  AND i.index_id > 0
+                  AND NOT EXISTS (
+                      SELECT 1 FROM SQLBestPracticeMonitoring bpm
+                      WHERE bpm.InstanceID = @InstanceID AND bpm.DBID = @DBID
+                        AND bpm.BestPracticeName = ''IndexFragmentation''
+                        AND bpm.ObjectName = t.name + ''.'' + i.name 
+                        AND bpm.Status = ''Unresolved''
+                  );
+
+                -- Unused Indexes
+                UPDATE bpm
+                SET Status = ''Resolved'', 
+                    Notes = ''Index is now being used.'', 
+                    ResolvedDate = GETDATE(),
+                    CurrentValue = CAST(u.user_seeks + u.user_scans + u.user_lookups AS NVARCHAR(20)) + '' seeks/scans/lookups''
+                FROM SQLBestPracticeMonitoring bpm
+                JOIN sys.indexes i ON RIGHT(bpm.ObjectName, LEN(bpm.ObjectName) - CHARINDEX(''.'', bpm.ObjectName + ''.'')) = i.name AND bpm.DBID = DB_ID()
+                JOIN sys.tables t ON LEFT(bpm.ObjectName, CHARINDEX(''.'', bpm.ObjectName + ''.'') - 1) = t.name AND i.object_id = t.object_id
+                JOIN sys.dm_db_index_usage_stats u ON i.object_id = u.object_id
+                    AND i.index_id = u.index_id AND u.database_id = DB_ID()
+                WHERE bpm.InstanceID = @InstanceID AND bpm.DBID = @DBID 
+                  AND bpm.BestPracticeName = ''UnusedIndex'' 
+                  AND bpm.Status = ''Unresolved''
+                  AND (u.user_seeks + u.user_scans + u.user_lookups > 0);
+
+                INSERT INTO SQLBestPracticeMonitoring (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, ObjectName, CurrentValue, RecommendedValue, Status, Notes)
+                SELECT @InstanceID, @DBID, @InstanceName, @DBName, ''UnusedIndex'',
+                       t.name + ''.'' + i.name,
+                       ''0 seeks/scans/lookups'', ''Remove or verify necessity'', ''Unresolved'',
+                       ''Index has not been used. Consider dropping to save space.''
+                FROM sys.indexes i
+                JOIN sys.tables t ON i.object_id = t.object_id
+                LEFT JOIN sys.dm_db_index_usage_stats u ON i.object_id = u.object_id
+                    AND i.index_id = u.index_id AND u.database_id = DB_ID()
+                WHERE i.index_det > 1
+                  AND i.is_primary_key = 0
+                  AND i.is_unique_constraint = 0
+                  AND (u.user_seeks + u.user_scans + u.user_lookups = 0 OR u.object_id IS NULL)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM SQLBestPracticeMonitoring bpm
+                      WHERE bpm.InstanceID = @InstanceID AND bpm.DBID = @DBID
+                        AND bpm.BestPracticeName = ''UnusedIndex''
+                        AND bpm.ObjectName = t.name + ''.'' + i.name 
+                        AND bpm.Status = ''Unresolved''
+                  );
+
+                -- Duplicate Indexes
+                UPDATE bpm
+                SET Status = ''Resolved'', 
+                    Notes = ''Duplicate index resolved (likely dropped).'', 
+                    ResolvedDate = GETDATE(),
+                    CurrentValue = ''None''
+                FROM SQLBestPracticeMonitoring bpm
+                WHERE bpm.InstanceID = @InstanceID AND bpm.DBID = @DBID 
+                  AND bpm.BestPracticeName = ''DuplicateIndex'' 
+                  AND bpm.Status = ''Unresolved''
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM (
+                        SELECT t.name AS TableName, i.name AS IndexName, i.index_id,
+                            (SELECT STRING_AGG(c.name, '','') WITHIN GROUP (ORDER BY ic.key_ordinal)
+                             FROM sys.index_columns ic JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
+                             WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.is_included_column = 0) AS KeyColumns,
+                            (SELECT STRING_AGG(c.name, '','') WITHIN GROUP (ORDER BY ic.index_column_id)
+                             FROM sys.index_columns ic JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
+                             WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.is_included_column = 1) AS IncludedColumns
+                        FROM sys.indexes i
+                        JOIN sys.tables t ON i.object_id = t.object_id
+                        WHERE i.is_primary_key = 0 AND i.is_unique_constraint = 0 AND i.type_desc != ''HEAP'' AND i.is_disabled = 0
+                    ) AS CurrentIndexes
+                    JOIN (
+                        SELECT t.name AS TableName, i.name AS IndexName, i.index_id,
+                            (SELECT STRING_AGG(c.name, '','') WITHIN GROUP (ORDER BY ic.key_ordinal) 
+                             FROM sys.index_columns ic JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id 
+                             WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.is_included_column = 0) AS KeyColumns,
+                            (SELECT STRING_AGG(c.name, '','') WITHIN GROUP (ORDER BY ic.index_column_id) 
+                             FROM sys.index_columns ic JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id 
+                             WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.is_included_column = 1) AS IncludedColumns
+                        FROM sys.indexes i
+                        JOIN sys.tables t ON i.object_id = t.object_id
+                        WHERE i.is_primary_key = 0 AND i.is_unique_constraint = 0 AND i.type_desc != ''HEAP'' AND i.is_disabled = 0
+                    ) AS OtherIndexes ON CurrentIndexes.TableName = OtherIndexes.TableName
+                        AND ISNULL(CurrentIndexes.KeyColumns, '''') = ISNULL(OtherIndexes.KeyColumns, '''')
+                        AND ISNULL(CurrentIndexes.IncludedColumns, '''') = ISNULL(OtherIndexes.IncludedColumns, '''')
+                        AND CurrentIndexes.index_id > OtherIndexes.index_id
+                    WHERE bpm.ObjectName = CurrentIndexes.TableName + '' ('' + CurrentIndexes.IndexName + '')''
+                  );
+
+                ;WITH IndexColumns AS (
+                    SELECT t.name AS TableName, i.name AS IndexName, i.index_id,
+                        (SELECT STRING_AGG(c.name, '','') WITHIN GROUP (ORDER BY ic.key_ordinal)
+                         FROM sys.index_columns ic JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
+                         WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.is_included_column = 0) AS KeyColumns,
+                        (SELECT STRING_AGG(c.name, '','') WITHIN GROUP (ORDER BY ic.index_column_id)
+                         FROM sys.index_columns ic JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
+                         WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.is_included_column = 1) AS IncludedColumns
+                    FROM sys.indexes i
+                    JOIN sys.tables t ON i.object_id = t.object_id
+                    WHERE i.is_primary_key = 0 AND i.is_unique_constraint = 0 AND i.type_desc != ''HEAP'' AND i.is_disabled = 0
+                ),
+                DuplicateIndexes AS (
+                    SELECT ic1.TableName, ic1.IndexName, ic1.KeyColumns, ic1.IncludedColumns
+                    FROM IndexColumns ic1
+                    JOIN IndexColumns ic2 ON ic1.TableName = ic2.TableName
+                        AND ISNULL(ic1.KeyColumns, '''') = ISNULL(ic2.KeyColumns, '''')
+                        AND ISNULL(ic1.IncludedColumns, '''') = ISNULL(ic2.IncludedColumns, '''')
+                        AND ic1.index_id > ic2.index_id
+                )
+                INSERT INTO SQLBestPracticeMonitoring (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, ObjectName, CurrentValue, RecommendedValue, Status, Notes)
+                SELECT DISTINCT @InstanceID, @DBID, @InstanceName, @DBName, ''DuplicateIndex'',
+                       di.TableName + '' ('' + di.IndexName + '')'', 
+                       di.KeyColumns, 
+                       ''Remove duplicate index'', ''Unresolved'',
+                       ''Duplicate indexes waste space. Index definition matches another index.''
+                FROM DuplicateIndexes di
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM SQLBestPracticeMonitoring bpm
+                    WHERE bpm.InstanceID = @InstanceID AND bpm.DBID = @DBID
+                      AND bpm.BestPracticeName = ''DuplicateIndex''
+                      AND bpm.ObjectName = di.TableName + '' ('' + di.IndexName + '')''
+                      AND bpm.Status = ''Unresolved''
+                );
+
+                -- Missing Indexes
+                INSERT INTO SQLBestPracticeMonitoring (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, ObjectName, CurrentValue, RecommendedValue, Status, Notes)
+                SELECT TOP 10 @InstanceID, @DBID, @InstanceName, @DBName, ''MissingIndex'',
+                       OBJECT_NAME(mid.object_id) + '' ('' + ISNULL(mid.equality_columns, '''') +
+                       CASE WHEN mid.equality_columns IS NOT NULL AND mid.inequality_columns IS NOT NULL THEN '', '' ELSE '''' END +
+                       ISNULL(mid.inequality_columns, '''') + '')'',
+                       ''Missing'', ''Consider creating index'', ''Unresolved'',
+                       ''Missing index could improve performance. Impact: '' + CAST(ROUND(migs.avg_total_user_cost * migs.avg_user_impact * (migs.user_seeks + migs.user_scans), 0) AS NVARCHAR(20))
+                FROM sys.dm_db_missing_index_details mid
+fe                JOIN sys.sys.dm_db_missing_index_groups mig ON mid.index_handle = mig.index_handle
+                JOIN sys.dm_db_missing_index_group_stats migs ON mig.index_group_handle = migs.group_handle
+                WHERE mid.database_id = DB_ID()
+                  AND migs.avg_total_user_cost * migs.avg_user_impact * (migs.user_seeks + migs.user_scans) > 10000
+                  AND NOT EXISTS (
+                      SELECT 1 FROM SQLBestPracticeMonitoring bpm
+                      WHERE bpm.InstanceID = @InstanceID AND bpm.DBID = @DBID
+                        AND bpm.BestPracticeName = ''MissingoferIndex''
+                        AND bpm.ObjectName LIKE OBJECT_NAME(mid.object_id) + ''%''
+                        AND bpm.Status = ''Unresolved''
+                  )
+                ORDER BY migs.avg_total_user_cost * migs.avg_user_impact * (migs.user_seeks + migs.user_scans) DESC;
+
+                -- Outdated Statistics
+                UPDATE bpm
+                SET Status = ''Resolved'', 
+                    Notes = ''Statistics are up-to-date.'', 
+                    ResolvedDate = GETDATE(),
+                    CurrentValue = CAST(DATEDIFF(day, sp.last_updated, GETDATE()) AS NVARCHAR(10)) + '' days old''
+                FROM SQLBestPracticeMonitoring bpm
+                JOIN sys.stats s ON RIGHT(bpm.ObjectName, LEN(bpm.ObjectName) - CHARINDEX(''.'', bpm.ObjectName + ''.'')) = s.name AND bpm.DBID = DB_ID()
+                JOIN sys.tables t ON LEFT(bpm.ObjectName, CHARINDEX(''.'', bpm.ObjectName + ''.'') - 1) = t.name AND s.object_id = t.object_id
+                CROSS APPLY sys.dm_db_stats_properties(s.object_id, s.stats_id) sp
+                WHERE bpm.InstanceID = @InstanceID AND bpm.DBID = @DBID 
+                  AND bpm.BestPracticeName = ''OutdatedStatistics'' 
+                  AND bpm.Status = ''Unresolved''
+                  AND DATEDIFF(day, sp.last_updated, GETDATE()) <= 7;
+
+                INSERT INTO SQLBestPracticeMonitoring (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+                SELECT @InstanceID, @DBID, @InstanceName, @DBName, ''OutdatedStatistics'',
+                       CAST(DATEDIFF(day, sp.last_updated, GETDATE()) AS NVARCHAR(10)) + '' days old'',
+                       ''< 7 days'', ''Unresolved'',
+                       ''Statistics are '' + CAST(DATEDIFF(day, sp.last_updated, GETDATE()) AS NVARCHAR(10)) + '' days old. Consider updating.''
+                FROM sys.stats s
+                JOIN sys.tables t ON s.object_id = t.object_id
+                CROSS APPLY sys.dm_db_stats_properties(s.object_id, s.stats_id) sp
+                WHERE DATEDIFF(day, sp.last_updated, GETDATE()) > 7
+                  AND sp.rows > 1000
+                  AND NOT EXISTS (
+                      SELECT 1 FROM SQLBestPracticeMonitoring bpm
+                      WHERE bpm.InstanceID = @InstanceID AND bpm.DBID = @DBID
+                        AND bpm.BestPracticeName = ''OutdatedStatistics''
+                        AND bpm.ObjectName = t.name + ''.'' + s.name
+                        AND bpm.Status = ''Unresolved''
+                  );
+                ';
+
+                EXEC sp_executesql @SQL, N'@InstanceID INT, @DBID INT, @InstanceName NVARCHAR(100), @DBName SYSNAME, @LatestCompatLevel INT',
+                                   @InstanceID, @DBID, @InstanceName, @DBName, @LatestCompatLevel;
+            END
+
+        END TRY
+        BEGIN CATCH
+            INSERT INTO SQLBestPracticeMonitoringErrors (InstanceID, DBID, DatabaseName, BestPracticeName, ErrorMessage, ErrorLine, LogTime)
+            SELECT @InstanceID, @DBID, @DBName, 'Unknown', ERROR_MESSAGE(), ERROR_LINE(), GETDATE();
+            INSERT INTO @DebugLog (LogMessage, LogTime) 
+            SELECT 'Error in database ' + @DBName + ': ' + ERROR_MESSAGE(), GETDATE();
+        END CATCH;
+
+        FETCH NEXT FROM db_cursor INTO @InstanceID, @InstanceName, @DBID, @DBName;
+    END
+
+    CLOSE db_cursor;
+    DEALLOCATE db_cursor;
+
+    -- ====================================================================================================
+    --- Cleanup Resolved Issues and Stale Records
+    -- ====================================================================================================
+
+    INSERT INTO @DebugLog (LogMessage, LogTime) SELECT 'Starting cleanup', GETDATE();
+
+    -- Instance-Level Cleanup
+    UPDATE bpm
+    SET Status = 'Resolved', 
+        Notes = 'Configuration is now compliant.', 
+        ResolvedDate = GETDATE(),
+        CurrentValue = CASE 
+            WHEN BestPracticeName = 'MaxDOP' THEN (SELECT CAST(value_in_use AS NVARCHAR(255)) FROM sys.configurations WHERE name = 'Max degree of parallelism')
+            WHEN BestPracticeName = 'CostThresholdParallelism' THEN (SELECT CAST(value_in_use AS NVARCHAR(255)) FROM sys.configurations WHERE name = 'cost threshold for parallelism')
+            WHEN BestPracticeName = 'MaxServerMemory' THEN (SELECT CAST(value_in_use AS NVARCHAR(255)) + ' MB' FROM sys.configurations WHERE name = 'max server memory (MB)')
+            WHEN BestPracticeName = 'TempdbFileCount' THEN (SELECT CAST(COUNT(*) AS NVARCHAR(255)) + ' files' FROM sys.master_files WHERE database_id = DB_ID('tempdb') AND type = 0)
+            WHEN BestPracticeName = 'InstantFileInitialization' THEN (SELECT CASE WHEN instant_file_initialization_enabled = 1 THEN 'Enabled' ELSE 'Disabled' END FROM sys.dm_server_services WHERE filename LIKE '%sqlservr.exe%')
+            WHEN BestPracticeName = 'BackupCompressionDefault' THEN (SELECT CASE WHEN CAST(value_in_use AS INT) = 1 THEN 'Enabled' ELSE 'Disabled' END FROM sys.configurations WHERE name = 'backup compression default')
+            WHEN BestPracticeName = 'OptimizeAdHocWorkloads' THEN (SELECT CASE WHEN CAST(value_in_use AS INT) = 1 THEN 'Enabled' ELSE 'Disabled' END FROM sys.configurations WHERE name = 'optimize for ad hoc workloads')
+            WHEN BestPracticeName = 'RemoteDAC' THEN (SELECT CASE WHEN CAST(value_in_use AS INT) = 1 THEN 'Enabled' ELSE 'Disabled' END FROM sys.configurations WHERE name = 'remote admin connections')
+            WHEN BestPracticeName = 'SQLAgentAccount' THEN (SELECT service_account FROM sys.dm_server_services WHERE filename LIKE '%sqlagent.exe%')
+        END
+    FROM SQLBestPracticeMonitoring bpm
+    WHERE bpm.DBID = 0
+      AND bpm.Status = 'Unresolved'
+      AND (
+          (BestPracticeName = 'MaxDOP' AND EXISTS (SELECT 1 FROM sys.configurations WHERE name = 'Max degree of parallelism' AND CAST(value_in_use AS INT) = @RecommendedMaskDOP))
+          OR (BestPracticeName = 'CostThresholdParallelism' AND EXISTS (SELECT 1 FROM sys.configurations WHERE name = 'cost threshold for parallelism' AND CAST(value_in_use AS INT) >= @RecommendedCostThreshold))
+          OR (BestPracticeName = 'MaxServerMemory' AND EXISTS (SELECT 1 FROM sys.configurations WHERE name = 'max server memory (MB)' scenario AND CAST(value_in_use AS BIGINT) != 2147483647 AND CAST(value_in_use AS BIGINT) < (@TotalPhysicalMemory * 0.9)))
+          OR (BestPracticeName = 'TempdbFileCount' AND EXISTS (SELECT 1 FROM sys.master_files WHERE database_id = DB_ID('tempdb') AND type = 0 GROUP BY database_id HAVING COUNT(*) = @TempdbRecommendedFiles))
+          OR (BestPracticeName = 'InstantFileInitialization' AND EXISTS (SELECT 1 FROM sys.dm_server_services WHERE filename LIKE '%sqlservr.exe%' AND instant_file_initialization_enabled = 1))
+          OR (BestPracticeName = 'BackupCompressionDefault' AND EXISTS (SELECT 1 FROM sys.configurations WHERE name = 'backup compression default' AND CAST(value_in_use AS INT) = 1))
+          OR (BestPracticeName = 'OptimizeAdHocWorkloads' AND EXISTS (SELECT 1 FROM sys.configurations WHERE name = 'optimize for ad hoc workloads' AND CAST(value_in_use AS INT) = 1))
+          OR (BestPracticeName = 'RemoteDAC' AND EXISTS (SELECT 1 FROM sys.configurations WHERE name = 'remote admin connections' AND CAST(value_in_use AS INT) = 1))
+          OR (BestPracticeName = 'SQLAgentAccount' AND EXISTS (SELECT 1 FROM sys.dm_server_services WHERE filename LIKE '%sqlagent.exe%' AND service_account NOT LIKE '%LocalSystem%'))
+      );
+
+    -- Database-Level and Schema-Level Cleanup
+    DECLARE @CleanupSQL NVARCHAR(MAX) = '';
+    DECLARE db_cleanup_cursor CURSOR LOCAL FAST_FORWARD FOR
+    SELECT DBID, Name
+    FROM DBInfo
+    WHERE Name NOT IN ('master', 'model', 'msdb', 'tempdb', 'Boo_util', 'Dummy', 'Dummy1', 'dummy2', 'DUMMY');
+
+    OPEN db_cleanup_cursor;
+    FETCH NEXT FROM db_cleanup_cursor INTO @DBID, @DBName;
+
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        BEGIN TRY
+            SET @CleanupSQL = '
+USE [' + @DBName + '];
+
+-- Schema-Level Cleanup
+UPDATE bpm
+SET Status = ''Resolved'', 
+    Notes = ''Object is now compliant or no longer exists.'', 
+    ResolvedDate = GETDATE(),
+    CurrentValue = CASE 
+        WHEN bpm.BestPracticeName = ''MissingPrimaryKey'' THEN ''Exists''
+        WHEN bpm.BestPracticeName = ''TableNaming'' THEN t.name
+        WHEN bpm.BestPracticeName = ''HeapTable'' THEN ''Clustered Index Exists''
+        WHEN bpm.BestPracticeName = ''DeprecatedDataType'' THEN (SELECT TYPE_NAME(c.system_type_id) FROM sys.columns c JOIN sys.tables t2 ON c.object_id = t2.object_id WHERE t2.name = t.name AND c.name = RIGHT(bpm.ObjectName, LEN(bpm.ObjectName) - CHARINDEX(''.'', bpm.ObjectName + ''.'')))
+        WHEN bpm.BestPracticeName = ''UntrustedForeignKey'' THEN ''Trusted''
+        WHEN bpm.BestPracticeName = ''IndexFragmentation'' THEN (SELECT CAST(ROUND(f.avg_fragmentation_in_percent, 2) AS NVARCHAR(10)) + ''%'' FROM sys.dm_db_index_physical_stats(DB_ID(), i.object_id, i.index_id, NULL, ''LIMITED'') f WHERE i.name = RIGHT(bpm.ObjectName, LEN(bpm.ObjectName) - CHARINDEX(''.'', bpm.ObjectName + ''.'')))
+        WHEN bpm.BestPracticeName = ''UnusedIndex'' THEN (SELECT CAST(COALESCE(u.user_seeks + u.user_scans + u.user_lookups, 0) AS NVARCHAR(20)) + '' seeks/scans/lookups'' FROM sys.dm_db_index_usage_stats u WHERE u.object_id = i.object_id AND u.index_id = i.index_id AND u.database_id = DB_ID())
+        WHEN bpm.BestPracticeName = ''OutdatedStatistics'' THEN (SELECT CAST(DATEDIFF(day, sp.last_updated, GETDATE()) AS NVARCHAR(10)) + '' days old'' FROM sys.stats s CROSS APPLY sys.dm_db_stats_properties(s.object_id, s.stats_id) sp WHERE s.object_id = t.object_id AND s.name = RIGHT(bpm.ObjectName, LEN(bpm.ObjectName) - CHARINDEX(''.'', bpm.ObjectName + ''.'')))
+        WHEN bpm.BestPracticeName = ''MissingIndex'' THEN ''Exists''
+        WHEN bpm.BestPracticeName = ''DuplicateIndex'' THEN ''None''
+    END
+FROM SQLBestPracticeMonitoring bpm
+LEFT JOIN sys.tables t ON bpm.ObjectName LIKE t.name + ''%'' AND bpm.DBID = DB_ID()
+LEFT JOIN sys.indexes i ON i.object_id = t.object_id AND i.name = RIGHT(bpm.ObjectName, LEN(bpm.ObjectName) - CHARINDEX(''.'', bpm.ObjectName + ''.'')) AND bpm.BestPracticeName IN (''IndexFragmentation'', ''UnusedIndex'', ''DuplicateIndex'')
+LEFT JOIN sys.foreign_keys fk ON bpm.ObjectName = OBJECT_SCHEMA_NAME(fk.parent_object_id) + ''.'' + OBJECT_NAME(fk.parent_object_id) + ''.'' + fk.name AND bpm.BestPracticeName = ''UntrustedForeignKey''
+LEFT JOIN sys.columns c ON c.object_id = t.object_id AND c.name = RIGHT(bpm.ObjectName, LEN(bpm.ObjectName) - CHARINDEX(''.'', bpm.ObjectName + ''.'')) AND bpm.BestPracticeName = ''DeprecatedDataType''
+WHERE bpm.InstanceID = @InstanceID 
+  AND bpm.DBID = @DBID 
+  AND bpm.Status = ''Unresolved''
+  AND (
+      (bpm.BestPracticeName = ''MissingPrimaryKey'' AND EXISTS (SELECT 1 FROM sys.indexes i2 WHERE i2.object_id = t.object_id AND i2.is_primary_key = 1))
+      OR (bpm.BestPracticeName = ''TableNaming'' AND t.name NOT LIKE ''%[^a-zA-Z0-9_]%'' AND t.name LIKE ''[a-zA-Z]%'')
+      OR (bpm.BestPracticeName = ''HeapTable'' AND EXISTS (SELECT 1 FROM sys.indexes i2 WHERE i2.object_id = t.object_id AND i2.type = 1))
+      OR (bpm.BestPracticeName = ''DeprecatedDataType'' AND TYPE_NAME(c.system_type_id) NOT IN (''ntext'', ''text'', ''image''))
+      OR (bpm.BestPracticeName = ''UntrustedForeignKey'' AND fk.is_not_trusted = 0)
+      OR (bpm.BestPracticeName = ''IndexFragmentation'' AND EXISTS (SELECT 1 FROM sys.dm_db_index_physical_stats(DB_ID(), i.object_id, i.index_id, NULL, ''LIMITED'') f WHERE f.avg_fragmentation_in_percent <= 30))
+      OR (bpm.BestPracticeName = ''UnusedIndex'' AND EXISTS (SELECT 1 FROM sys.dm_db_index_usage_stats u WHERE u.object_id = i.object_id AND u.index_id = i.index_id AND u.database_id = DB_ID() AND (u.user_seeks + u.user_scans + u.user_lookups > 0)))
+      OR (bpm.BestPracticeName = ''OutdatedStatistics'' AND EXISTS (SELECT 1 FROM sys.stats s CROSS APPLY sys.dm_db_stats_properties(s.object_id, s.stats_id) sp WHERE s.object_id = t.object_id AND s.name = RIGHT(bpm.ObjectName, LEN(bpm.ObjectName) - CHARINDEX(''.'', bpm.ObjectName + ''.'')) AND DATEDIFF(day, sp.last_updated, GETDATE()) <= 7))
+      OR (bpm.BestPracticeName = ''MissingIndex'' AND NOT EXISTS (SELECT 1 FROM sys.dm_db_missing_index_details mid WHERE mid.database_id = DB_ID() AND mid.object_id = t.object_id AND bpm.ObjectName LIKE OBJECT_NAME(mid.object_id) + ''%''))
+      OR (bpm.BestPracticeName = ''DuplicateIndex'' AND NOT EXISTS (
+          SELECT 1 FROM sys.indexes i2 JOIN sys.tables t2 ON i2.object_id = t2.object_id
+          JOIN (SELECT t3.name AS TableName, i3.name AS IndexName,
+                       (SELECT STRING_AGG(c.name, '','') WITHIN GROUP (ORDER BY ic.key_ordinal)
+                        FROM sys.index_columns ic JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
+                        WHERE ic.object_id = i3.object_id AND ic.index_id = i3.index_id AND ic.is_included_column = 0) AS KeyColumns,
+                       (SELECT STRING_AGG(c.name, '','') WITHIN GROUP (ORDER BY ic.index_column_id)
+                        FROM sys.index_columns ic JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
+                        WHERE ic.object_id = i3.object_id AND ic.index_id = i3.index_id AND ic.is_included_column = 1) AS IncludedColumns
+                FROM sys.indexes i3 JOIN sys.tables t3 ON i3.object_id = t3.object_id
+                WHERE i3.is_primary_key = 0 AND i3.is_unique_constraint = 0 AND i3.type_desc != ''HEAP'' AND i3.is_disabled = 0) AS OtherIndexes
+          ON t2.name = OtherIndexes.TableName AND ISNULL((SELECT STRING_AGG(c.name, '','') WITHIN GROUP (ORDER BY ic.key_ordinal) FROM sys.index_columns ic JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id WHERE ic.object_id = i2.object_id AND ic.index_id = i2.index_id AND ic.is_included_column = 0), '''') = ISNULL(OtherIndexes.KeyColumns, '''') AND ISNULL((SELECT STRING_AGG(c.name, '','') WITHIN GROUP (ORDER BY ic.index_column_id) FROM sys.index_columns ic JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id WHERE ic.object_id = i2.object_id AND ic.index_id = i2.index_id AND ic.is_included_column = 1), '''') = ISNULL(OtherIndexes.IncludedColumns, '''') AND i2.index_id > OtherIndexes.index_id
+          WHERE bpm.ObjectName = t2.name + '' ('' + i2.name + '')''
+      ))
+      OR (t.object_id IS NULL AND bpm.ObjectName IS NOT NULL AND bpm.BestPracticeName NOT IN (''AutoGrowthSettings'', ''RecentBackup'', ''LogBackupFrequency'', ''CompatibilityLevel'', ''AutoUpdateStatistics'', ''LegacyCardinalityEstimation''))
+  );
+
+-- Database-Level Cleanup
+UPDATE bpm
+SET Status = ''Resolved'', 
+    Notes = ''Configuration is now compliant.'', 
+    ResolvedDate = GETDATE(),
+    CurrentValue = CASE 
+        WHEN bpm.BestPracticeName = ''AutoShrink'' THEN ''No''
+        WHEN bpm.BestPracticeName = ''AutoClose'' THEN ''No''
+        WHEN bpm.BestPracticeName = ''PageVerify'' THEN ''CHECKSUM''
+        WHEN bpm.BestPracticeName = ''CollationDifference'' THEN ''No''
+        WHEN bpm.BestPracticeName = ''RecoveryModel'' THEN ''FULL''
+        WHEN bpm.BestPracticeName = ''Trustworthy'' THEN ''No''
+        WHEN bpm.BestPracticeName = ''TargetRecoveryTime'' THEN CAST(d.target_recovery_time_in_seconds AS NVARCHAR(255)) + '' seconds''
+        WHEN bpm.BestPracticeName = ''AutoCreateStatsAsync'' THEN ''Enabled (Async)''
+        WHEN bpm.BestPracticeName = ''RecentBackup'' THEN (SELECT CAST(DATEDIFF(day, MAX(bs.backup_finish_date), GETDATE()) AS NVARCHAR(10)) + '' days ago'' FROM msdb.dbo.backupset bs WHERE bs.database_name = d.name AND bs.type = ''D'')
+        WHEN bpm.BestPracticeName = ''LogBackupFrequency'' THEN (SELECT CAST(DATEDIFF(hour, MAX(bs.backup_finish_date), GETDATE()) AS NVARCHAR(10)) + '' hours ago'' FROM msdb.dbo.backupset bs WHERE bs.database_name = d.name AND bs.type = ''L'')
+        WHEN bpm.BestPracticeName = ''CompatibilityLevel'' THEN CAST(d.compatibility_level AS NVARCHAR(10))
+        WHEN bpm.BestPracticeName = ''AutoUpdateStatistics'' THEN ''Enabled''
+        WHEN bpm.BestPracticeName = ''LegacyCardinalityEstimation'' THEN ''OFF''
+    END
+FROM SQLBestPracticeMonitoring bpm
+JOIN sys.databases d ON bpm.DBID = d.database_id
+WHERE bpm.InstanceID = @InstanceID 
+  AND bpm.DBID = @DBID 
+  AND bpm.Status = ''Unresolved''
+  AND (
+      (bpm.BestPracticeName = ''AutoShrink'' AND d.is_auto_shrink_on = 0)
+      OR (bpm.BestPracticeName = ''AutoClose'' AND d.is_auto_close_on = 0)
+      OR (bpm.BestPracticeName = ''PageVerify'' AND d.page_verify_option_desc = ''CHECKSUM'')
+      OR (bpm.BestPracticeName = ''CollationDifference'' AND d.collation_name = (SELECT collation_name FROM sys.databases WHERE database_id = DB_ID(''master'')))
+      OR (bpm.BestPracticeName = ''RecoveryModel'' AND d.recovery_model_desc = ''FULL'')
+      OR (bpm.BestPracticeName = ''Trustworthy'' AND d.is_trustworthy_on = 0 AND d.name != ''msdb'')
+      OR (bpm.BestPracticeName = ''TargetRecoveryTime'' AND d.target_recovery_time_in_seconds <= 60)
+      OR (bpm.BestPracticeName = ''AutoCreateStatsAsync'' AND d.is_auto_create_stats_on = 1 AND d.is_auto_update_stats_async_on = 1)
+      OR (bpm.BestPracticeName = ''RecentBackup'' AND EXISTS (SELECT 1 FROM msdb.dbo.backupset bs WHERE bs.database_name = d.name AND bs.type = ''D'' AND DATEDIFF(day, bs.backup_finish_date, GETDATE()) <= 7))
+      OR (bpm.BestPracticeName = ''LogBackupFrequency'' AND d.recovery_model_desc = ''FULL'' AND EXISTS (SELECT 1 FROM msdb.dbo.backupset bs WHERE bs.database_name = d.name AND bs.type = ''L'' AND DATEDIFF(hour, bs.backup_finish_date, GETDATE()) <= 4))
+      OR (bpm.BestPracticeName = ''CompatibilityLevel'' AND d.compatibility_level >= @LatestCompatLevel)
+      OR (bpm.BestPracticeName = ''AutoUpdateStatistics'' AND d.is_auto_update_stats_on = 1)
+      OR (bpm.BestPracticeName = ''LegacyCardinalityEstimation'' AND EXISTS (SELECT 1 FROM sys.database_scoped_configurations WHERE name = ''LEGACY_CARDINALITY_ESTIMATION'' AND CAST(value AS BIT) = 0))
+  );
+';
+
+EXEC sp_executesql @CleanupSQL, N'@InstanceID INT, @DBID INT, @InstanceName NVARCHAR(100), @DBName SYSNAME, @LatestCompatLevel INT',
+                   @InstanceID, @DBID, @InstanceName, @DBName, @LatestCompatLevel;
+
+        END TRY
+        BEGIN CATCH
+            INSERT INTO SQLBestPracticeMonitoringErrors (InstanceID, DBID, DatabaseName, BestPracticeName, ErrorMessage, ErrorLine, LogTime)
+            SELECT @InstanceID, @DBID, @DBName, 'Cleanup', ERROR_MESSAGE(), ERROR_LINE(), GETDATE();
+            INSERT INTO @DebugLog (LogMessage, LogTime) 
+            SELECT 'Cleanup Error in database ' + @DBName + ': ' + ERROR_MESSAGE(), GETDATE();
+        END CATCH;
+
+        FETCH NEXT FROM db_cleanup_cursor INTO @DBID, @DBName;
+    END
+
+    CLOSE db_cleanup_cursor;
+    DEALLOCATE db_cleanup_cursor;
+
+    -- ====================================================================================================
+    --- Output Debug Log and Summary
+    -- ====================================================================================================
+
+    INSERT INTO @DebugLog (LogMessage, LogTime) SELECT 'Completed all checks and cleanup', GETDATE();
+
+    -- Output debug log
+    SELECT LogMessage, LogTime FROM @DebugLog ORDER BY LogTime;
+
+    -- Output summary of unresolved issues
+    SELECT BestPracticeName, DatabaseName, Status, COUNT(*) as IssueCount
+    FROM SQLBestPracticeMonitoring
+    WHERE Status = 'Unresolved'
+    GROUP BY BestPracticeName, DatabaseName, Status
+    ORDER BY BestPracticeName, DatabaseName;
+
+    PRINT 'SQL Best Practices Check Completed at ' + CONVERT(NVARCHAR(30), GETDATE(), 120);
+END
+GO
