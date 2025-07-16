@@ -1,0 +1,32 @@
+SELECT 
+    qi.query_id,
+    qh.query_text,
+    qh.user_name,
+    qh.warehouse_name,
+    qh.total_elapsed_time / 1000 AS execution_time_seconds,
+    qh.bytes_scanned,
+    qh.partitions_scanned,
+    qh.partitions_total,
+    qi.insight_type_id,
+    qi.message,
+    qi.suggestions
+FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_INSIGHTS qi
+JOIN SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY qh
+    ON qi.query_id = qh.query_id
+WHERE qi.start_time >= DATEADD(day, -7, CURRENT_TIMESTAMP())
+  AND qh.user_name IN (
+      SELECT DISTINCT user_name 
+      FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY 
+      WHERE role_name = 'ABC'
+  )
+  AND (qh.total_elapsed_time > 3600000 -- Queries longer than 1 hour (3600 seconds)
+       OR qi.insight_type_id IN (
+           'QUERY_INSIGHT_LOCAL_DISK_SPILLAGE',
+           'QUERY_INSIGHT_REMOTE_DISK_SPILLAGE',
+           'QUERY_INSIGHT_INAPPLICABLE_FILTER_ON_TABLE_SCAN',
+           'QUERY_INSIGHT_UNSELECTIVE_FILTER'
+       )
+       OR qh.bytes_scanned > 1000000000 -- Queries scanning > 1GB
+       OR qh.partitions_scanned / NULLIF(qh.partitions_total, 0) > 0.8) -- Poor pruning (>80% partitions scanned)
+ORDER BY qh.total_elapsed_time DESC
+LIMIT 50;
