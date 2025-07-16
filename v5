@@ -1222,7 +1222,7 @@ BEGIN
     WHILE @@FETCH_STATUS = 0
     BEGIN
         BEGIN TRY
-            SET @CleanupSQL = '
+           SET @CleanupSQL = '
 USE [' + @DBName + '];
 
 -- Schema-Level Cleanup
@@ -1248,37 +1248,39 @@ LEFT JOIN sys.indexes i ON i.object_id = t.object_id AND i.name = RIGHT(bpm.Obje
 LEFT JOIN sys.foreign_keys fk ON bpm.ObjectName = OBJECT_SCHEMA_NAME(fk.parent_object_id) + ''.'' + OBJECT_NAME(fk.parent_object_id) + ''.'' + fk.name AND bpm.BestPracticeName = ''UntrustedForeignKey''
 LEFT JOIN sys.columns c ON c.object_id = t.object_id AND c.name = RIGHT(bpm.ObjectName, LEN(bpm.ObjectName) - CHARINDEX(''.'', bpm.ObjectName + ''.'')) AND bpm.BestPracticeName = ''DeprecatedDataType''
 WHERE bpm.InstanceID = @InstanceID 
-  AND bpm.DBID = @DBID 
-  AND bpm.Status = ''Unresolved''
-  AND (
-      (bpm.BestPracticeName = ''MissingPrimaryKey'' AND EXISTS (SELECT 1 FROM sys.indexes i2 WHERE i2.object_id = t.object_id AND i2.is_primary_key = 1))
-      OR (bpm.BestPracticeName = ''TableNaming'' AND t.name NOT LIKE ''%[^a-zA-Z0-9_]%'' AND t.name LIKE ''[a-zA-Z]%'')
-      OR (bpm.BestPracticeName = ''HeapTable'' AND EXISTS (SELECT 1 FROM sys.indexes i2 WHERE i2.object_id = t.object_id AND i2.type = 1))
-      OR (bpm.BestPracticeName = ''DeprecatedDataType'' AND TYPE_NAME(c.system_type_id) NOT IN (''ntext'', ''text'', ''image''))
-      OR (bpm.BestPracticeName = ''UntrustedForeignKey'' AND fk.is_not_trusted = 0)
-      OR (bpm.BestPracticeName = ''IndexFragmentation'' AND EXISTS (SELECT 1 FROM sys.dm_db_index_physical_stats(DB_ID(), i.object_id, i.index_id, NULL, ''LIMITED'') f WHERE f.avg_fragmentation_in_percent <= 30))
-      OR (bpm.BestPracticeName = ''UnusedIndex'' AND EXISTS (SELECT 1 FROM sys.dm_db_index_usage_stats u WHERE u.object_id = i.object_id AND u.index_id = i.index_id AND u.database_id = DB_ID() AND (u.user_seeks + u.user_scans + u.user_lookups > 0)))
-      OR (bpm.BestPracticeName = ''OutdatedStatistics'' AND EXISTS (SELECT 1 FROM sys.stats s CROSS APPLY sys.dm_db_stats_properties(s.object_id, s.stats_id) sp WHERE s.object_id = t.object_id AND s.name = RIGHT(bpm.ObjectName, LEN(bpm.ObjectName) - CHARINDEX(''.'', bpm.ObjectName + ''.'')) AND DATEDIFF(day, sp.last_updated, GETDATE()) <= 7))
-      OR (bpm.BestPracticeName = ''MissingIndex'' AND NOT EXISTS (SELECT 1 FROM sys.dm_db_missing_index_details mid WHERE mid.database_id = DB_ID() AND mid.object_id = t.object_id AND bpm.ObjectName LIKE OBJECT_NAME(mid.object_id) + ''%''))
-      OR (bpm.BestPracticeName = ''DuplicateIndex'' AND NOT EXISTS (
-          SELECT 1 FROM sys.indexes i2 JOIN sys.tables t2 ON i2.object_id = t2.object_id
-          JOIN (SELECT t3.name AS TableName, i3.name AS IndexName,
-                       (SELECT STRING_AGG(c.name, '','') WITHIN GROUP (ORDER BY ic.key_ordinal)
-                        FROM sys.index_columns ic JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
-                        WHERE ic.object_id = i3.object_id AND ic.index_id = i3.index_id AND ic.is_included_column = 0) AS KeyColumns,
-                       (SELECT STRING_AGG(c.name, '','') WITHIN GROUP (ORDER BY ic.index_column_id)
-                        FROM sys.index_columns ic JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
-                        WHERE ic.object_id = i3.object_id AND ic.index_id = i3.index_id AND ic.is_included_column = 1) AS IncludedColumns
+    AND bpm.DBID = @DBID 
+    AND bpm.Status = ''Unresolved''
+    AND (
+        (bpm.BestPracticeName = ''MissingPrimaryKey'' AND EXISTS (SELECT 1 FROM sys.indexes i2 WHERE i2.object_id = t.object_id AND i2.is_primary_key = 1))
+        OR (bpm.BestPracticeName = ''TableNaming'' AND t.name NOT LIKE ''%[^a-zA-Z0-9_]%'' AND t.name LIKE ''[a-zA-Z]%'')
+        OR (bpm.BestPracticeName = ''HeapTable'' AND EXISTS (SELECT 1 FROM sys.indexes i2 WHERE i2.object_id = t.object_id AND i2.type = 1))
+        OR (bpm.BestPracticeName = ''DeprecatedDataType'' AND TYPE_NAME(c.system_type_id) NOT IN (''ntext'', ''text'', ''image''))
+        OR (bpm.BestPracticeName = ''UntrustedForeignKey'' AND fk.is_not_trusted = 0)
+        OR (bpm.BestPracticeName = ''IndexFragmentation'' AND EXISTS (SELECT 1 FROM sys.dm_db_index_physical_stats(DB_ID(), i.object_id, i.index_id, NULL, ''LIMITED'') f WHERE f.avg_fragmentation_in_percent <= 30))
+        OR (bpm.BestPracticeName = ''UnusedIndex'' AND EXISTS (SELECT 1 FROM sys.dm_db_index_usage_stats u WHERE u.object_id = i.object_id AND u.index_id = i.index_id AND u.database_id = DB_ID() AND (u.user_seeks + u.user_scans + u.user_lookups > 0)))
+        OR (bpm.BestPracticeName = ''OutdatedStatistics'' AND EXISTS (SELECT 1 FROM sys.stats s CROSS APPLY sys.dm_db_stats_properties(s.object_id, s.stats_id) sp WHERE s.object_id = t.object_id AND s.name = RIGHT(bpm.ObjectName, LEN(bpm.ObjectName) - CHARINDEX(''.'', bpm.ObjectName + ''.'')) AND DATEDIFF(day, sp.last_updated, GETDATE()) <= 7))
+        OR (bpm.BestPracticeName = ''MissingIndex'' AND NOT EXISTS (SELECT 1 FROM sys.dm_db_missing_index_details mid WHERE mid.database_id = DB_ID() AND mid.object_id = t.object_id AND bpm.ObjectName LIKE OBJECT_NAME(mid.object_id) + ''%''))
+        OR (bpm.BestPracticeName = ''DuplicateIndex'' AND NOT EXISTS (
+            SELECT 1 FROM sys.indexes i2 JOIN sys.tables t2 ON i2.object_id = t2.object_id
+            JOIN (
+                SELECT t3.name AS TableName, i3.name AS IndexName,
+                    (SELECT STRING_AGG(c.name, '','') WITHIN GROUP (ORDER BY ic.key_ordinal)
+                     FROM sys.index_columns ic JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
+                     WHERE ic.object_id = i3.object_id AND ic.index_id = i3.index_id AND ic.is_included_column = 0) AS KeyColumns,
+                    (SELECT STRING_AGG(c.name, '','') WITHIN GROUP (ORDER BY ic.index_column_id)
+                     FROM sys.index_columns ic JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
+                     WHERE ic.object_id = i3.object_id AND ic.index_id = i3.index_id AND ic.is_included_column = 1) AS IncludedColumns
                 FROM sys.indexes i3 JOIN sys.tables t3 ON i3.object_id = t3.object_id
-                WHERE i3.is_primary_key = 0 AND i3.is_unique_constraint = 0 AND i3.type_desc != ''HEAP'' AND i3.is_disabled = 0) AS OtherIndexes
-          ON t2.name = OtherIndexes.TableName 
-            AND ISNULL((SELECT STRING_AGG(c.name, '','') WITHIN GROUP (ORDER BY ic.key_ordinal) FROM sys.index_columns ic JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id WHERE ic.object_id = i2.object_id AND ic.index_id = i2.index_id AND ic.is_included_column = 0), '''') = ISNULL(OtherIndexes.KeyColumns, '''') 
-            AND ISNULL((SELECT STRING_AGG(c.name, '','') WITHIN GROUP (ORDER BY ic.index_column_id) FROM sys.index_columns ic JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id WHERE ic.object_id = i2.object_id AND ic.index_id = i2.index_id AND ic.is_included_column = 1), '''') = ISNULL(OtherIndexes.IncludedColumns, '''') 
-            AND i2.index_id > OtherIndexes.index_id
-          WHERE bpm.ObjectName = t2.name + '' ('' + i2.name + '')''
-      ))
-      OR (t.object_id IS NULL AND bpm.ObjectName IS NOT NULL AND bpm.BestPracticeName NOT IN (''AutoGrowthSettings'', ''RecentBackup'', ''LogBackupFrequency'', ''CompatibilityLevel'', ''AutoUpdateStatistics'', ''LegacyCardinalityEstimation''))
-  );
+                WHERE i3.is_primary_key = 0 AND i3.is_unique_constraint = 0 AND i3.type_desc != ''HEAP'' AND i3.is_disabled = 0
+            ) AS OtherIndexes
+            ON t2.name = OtherIndexes.TableName 
+                AND ISNULL((SELECT STRING_AGG(c.name, '','') WITHIN GROUP (ORDER BY ic.key_ordinal) FROM sys.index_columns ic JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id WHERE ic.object_id = i2.object_id AND ic.index_id = i2.index_id AND ic.is_included_column = 0), '''') = ISNULL(OtherIndexes.KeyColumns, '''')
+                AND ISNULL((SELECT STRING_AGG(c.name, '','') WITHIN GROUP (ORDER BY ic.index_column_id) FROM sys.index_columns ic JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id WHERE ic.object_id = i2.object_id AND ic.index_id = i2.index_id AND ic.is_included_column = 1), '''') = ISNULL(OtherIndexes.IncludedColumns, '''')
+                AND i2.index_id > OtherIndexes.index_id
+            WHERE bpm.ObjectName = t2.name + '' ('' + i2.name + '')''
+        ))
+        OR (t.object_id IS NULL AND bpm.ObjectName IS NOT NULL AND bpm.BestPracticeName NOT IN (''AutoGrowthSettings'', ''RecentBackup'', ''LogBackupFrequency'', ''CompatibilityLevel'', ''AutoUpdateStatistics'', ''LegacyCardinalityEstimation''))
+    );
 
 -- Database-Level Cleanup
 UPDATE bpm
@@ -1303,25 +1305,26 @@ SET Status = ''Resolved'',
 FROM SQLBestPracticeMonitoring bpm
 JOIN sys.databases d ON bpm.DBID = d.database_id
 WHERE bpm.InstanceID = @InstanceID 
-  AND bpm.DBID = @DBID 
-  AND bpm.Status = ''Unresolved''
-  AND (
-      (bpm.BestPracticeName = ''AutoShrink'' AND d.is_auto_shrink_on = 0)
-      OR (bpm.BestPracticeName = ''AutoClose'' AND d.is_auto_close_on = 0)
-      OR (bpm.BestPracticeName = ''PageVerify'' AND d.page_verify_option_desc = ''CHECKSUM'')
-      OR (bpm.BestPracticeName = ''CollationDifference'' AND d.collation_name = (SELECT collation_name FROM sys.databases WHERE database_id = DB_ID(''master'')))
-      OR (bpm.BestPracticeName = ''RecoveryModel'' AND d.recovery_model_desc = ''FULL'')
-      OR (bpm.BestPracticeName = ''Trustworthy'' AND d.is_trustworthy_on = 0 AND d.name != ''msdb'')
-      OR (bpm.BestPracticeName = ''TargetRecoveryTime'' AND d.target_recovery_time_in_seconds <= 60)
-      OR (bpm.BestPracticeName = ''AutoCreateStatsAsync'' AND d.is_auto_create_stats_on = 1 AND d.is_auto_update_stats_async_on = 1)
-      OR (bpm.BestPracticeName = ''RecentBackup'' AND EXISTS (SELECT 1 FROM msdb.dbo.backupset bs WHERE bs.database_name = d.name AND bs.type = ''D'' AND DATEDIFF(day, bs.backup_finish_date, GETDATE()) <= 7))
-      OR (bpm.BestPracticeName = ''LogBackupFrequency'' AND d.recovery_model_desc = ''FULL'' AND EXISTS (SELECT 1 FROM msdb.dbo.backupset bs WHERE bs.database_name = d.name AND bs.type = ''L'' AND DATEDIFF(hour, bs.backup_finish_date, GETDATE()) <= 4))
-      OR (bpm.BestPracticeName = ''CompatibilityLevel'' AND d.compatibility_level >= @LatestCompatLevel)
-      OR (bpm.BestPracticeName = ''AutoUpdateStatistics'' AND d.is_auto_update_stats_on = 1)
-      OR (bpm.BestPracticeName = ''LegacyCardinalityEstimation'' AND EXISTS (SELECT 1 FROM sys.database_scoped_configurations WHERE name = ''LEGACY_CARDINALITY_ESTIMATION'' AND CAST(value AS BIT) = 0))
-  );
+    AND bpm.DBID = @DBID 
+    AND bpm.Status = ''Unresolved''
+    AND (
+        (bpm.BestPracticeName = ''AutoShrink'' AND d.is_auto_shrink_on = 0)
+        OR (bpm.BestPracticeName = ''AutoClose'' AND d.is_auto_close_on = 0)
+        OR (bpm.BestPracticeName = ''PageVerify'' AND d.page_verify_option_desc = ''CHECKSUM'')
+        OR (bpm.BestPracticeName = ''CollationDifference'' AND d.collation_name = (SELECT collation_name FROM sys.databases WHERE database_id = DB_ID(''master'')))
+        OR (bpm.BestPracticeName = ''RecoveryModel'' AND d.recovery_model_desc = ''FULL'')
+        OR (bpm.BestPracticeName = ''Trustworthy'' AND d.is_trustworthy_on = 0 AND d.name != ''msdb'')
+        OR (bpm.BestPracticeName = ''TargetRecoveryTime'' AND d.target_recovery_time_in_seconds <= 60)
+        OR (bpm.BestPracticeName = ''AutoCreateStatsAsync'' AND d.is_auto_create_stats_on = 1 AND d.is_auto_update_stats_async_on = 1)
+        OR (bpm.BestPracticeName = ''RecentBackup'' AND EXISTS (SELECT 1 FROM msdb.dbo.backupset bs WHERE bs.database_name = d.name AND bs.type = ''D'' AND DATEDIFF(day, bs.backup_finish_date, GETDATE()) <= 7))
+        OR (bpm.BestPracticeName = ''LogBackupFrequency'' AND d.recovery_model_desc = ''FULL'' AND EXISTS (SELECT 1 FROM msdb.dbo.backupset bs WHERE bs.database_name = d.name AND bs.type = ''L'' AND DATEDIFF(hour, bs.backup_finish_date, GETDATE()) <= 4))
+        OR (bpm.BestPracticeName = ''CompatibilityLevel'' AND d.compatibility_level >= @LatestCompatLevel)
+        OR (bpm.BestPracticeName = ''AutoUpdateStatistics'' AND d.is_auto_update_stats_on = 1)
+        OR (bpm.BestPracticeName = ''LegacyCardinalityEstimation'' AND EXISTS (SELECT 1 FROM sys.database_scoped_configurations WHERE name = ''LEGACY_CARDINALITY_ESTIMATION'' AND CAST(value AS BIT) = 0))
+    )
 ';
 
+-- Execute the dynamic SQL
 EXEC sp_executesql @CleanupSQL, N'@InstanceID INT, @DBID INT, @InstanceName NVARCHAR(100), @DBName SYSNAME, @LatestCompatLevel INT',
                    @InstanceID, @DBID, @InstanceName, @DBName, @LatestCompatLevel;
 
@@ -1338,3 +1341,18 @@ END
 
 CLOSE db_cleanup_cursor;
 DEALLOCATE db_cleanup_cursor;
+
+-- Output Debug Log and Summary
+INSERT INTO @DebugLog (LogMessage, LogTime) SELECT 'Completed all checks and cleanup', GETDATE();
+
+-- Output debug log
+SELECT LogMessage, LogTime FROM @DebugLog ORDER BY LogTime;
+
+-- Output summary of unresolved issues
+SELECT BestPracticeName, DatabaseName, Status, COUNT(*) as IssueCount
+FROM SQLBestPracticeMonitoring
+WHERE Status = 'Unresolved'
+GROUP BY BestPracticeName, DatabaseName, Status
+ORDER BY BestPracticeName, DatabaseName;
+
+PRINT 'SQL Best Practices Check Completed at ' + CONVERT(NVARCHAR(30), GETDATE(), 120);
