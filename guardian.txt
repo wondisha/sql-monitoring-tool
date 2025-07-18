@@ -1,0 +1,284 @@
+-- Connect to the SQL Server instance where you want to host the monitoring database (e.g., techpc)
+-- Create a new database for SQLGuardian monitoring data
+USE [master];
+GO
+
+IF NOT EXISTS (SELECT name FROM sys.databases WHERE name = 'SQLGuardianMonitor')
+BEGIN
+    CREATE DATABASE [SQLGuardianMonitor];
+    PRINT 'Database SQLGuardianMonitor created.';
+END
+ELSE
+BEGIN
+    PRINT 'Database SQLGuardianMonitor already exists.';
+END
+GO
+
+USE [SQLGuardianMonitor];
+GO
+
+-- Table to store all generated alerts
+IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[Alerts]') AND type in (N'U'))
+BEGIN
+CREATE TABLE [dbo].[Alerts](
+    [AlertId] BIGINT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+    [ServerName] NVARCHAR(128) NOT NULL,
+    [AlertTime] DATETIMEOFFSET(7) DEFAULT SYSDATETIMEOFFSET() NOT NULL,
+    [AlertLevel] NVARCHAR(50) NOT NULL, -- e.g., INFO, WARN, ALERT, CRITICAL
+    [AlertCategory] NVARCHAR(100) NOT NULL, -- e.g., Security, Performance, Availability, Configuration, Anomaly
+    [Message] NVARCHAR(MAX) NOT NULL,
+    [IsAcknowledged] BIT DEFAULT 0 NOT NULL,
+    [AcknowledgedBy] NVARCHAR(128) NULL,
+    [AcknowledgedTime] DATETIMEOFFSET(7) NULL
+);
+CREATE INDEX IX_Alerts_ServerName_AlertTime ON dbo.Alerts (ServerName, AlertTime DESC);
+PRINT 'Table Alerts created.';
+END
+ELSE
+BEGIN
+PRINT 'Table Alerts already exists.';
+END
+GO
+
+-- Table to store detailed performance metrics for queries
+IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[QueryPerformanceMetrics]') AND type in (N'U'))
+BEGIN
+CREATE TABLE [dbo].[QueryPerformanceMetrics](
+    [MetricId] BIGINT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+    [ServerName] NVARCHAR(128) NOT NULL,
+    [CaptureTime] DATETIMEOFFSET(7) DEFAULT SYSDATETIMEOFFSET() NOT NULL,
+    [DatabaseName] NVARCHAR(128) NOT NULL,
+    [QueryText] NVARCHAR(MAX) NOT NULL,
+    [ExecutionCount] BIGINT NOT NULL,
+    [TotalCpuSeconds] DECIMAL(18, 6) NOT NULL,
+    [AvgCpuSeconds] DECIMAL(18, 6) NOT NULL,
+    [AvgLogicalReads] BIGINT NOT NULL,
+    [AvgLogicalWrites] BIGINT NOT NULL,
+    [TotalElapsedTimeMs] BIGINT NULL, -- For long-running queries
+    [WaitType] NVARCHAR(60) NULL,     -- For waiting queries
+    [WaitTimeMs] BIGINT NULL,         -- For waiting queries
+    [ExecutionPlanXML] XML NULL,      -- Can store the actual plan XML for high-impact queries
+    [QueryCategory] NVARCHAR(50) NOT NULL -- e.g., CPU, IO, Waiting, Slow
+);
+CREATE INDEX IX_QPM_ServerName_CaptureTime ON dbo.QueryPerformanceMetrics (ServerName, CaptureTime DESC);
+CREATE INDEX IX_QPM_DatabaseName_AvgCpu_IO ON dbo.QueryPerformanceMetrics (DatabaseName, AvgCpuSeconds DESC, AvgLogicalReads DESC);
+PRINT 'Table QueryPerformanceMetrics created.';
+END
+ELSE
+BEGIN
+PRINT 'Table QueryPerformanceMetrics already exists.';
+END
+GO
+
+-- Table to store index fragmentation details
+IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[IndexFragmentation]') AND type in (N'U'))
+BEGIN
+CREATE TABLE [dbo].[IndexFragmentation](
+    [FragmentId] BIGINT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+    [ServerName] NVARCHAR(128) NOT NULL,
+    [CaptureTime] DATETIMEOFFSET(7) DEFAULT SYSDATETIMEOFFSET() NOT NULL,
+    [DatabaseName] NVARCHAR(128) NOT NULL,
+    [SchemaName] NVARCHAR(128) NOT NULL,
+    [TableName] NVARCHAR(128) NOT NULL,
+    [IndexName] NVARCHAR(128) NOT NULL,
+    [AvgFragmentationInPercent] DECIMAL(5,2) NOT NULL,
+    [PageCount] BIGINT NOT NULL,
+    [Recommendation] NVARCHAR(100) NOT NULL -- REBUILD or REORGANIZE
+);
+CREATE INDEX IX_IF_ServerName_CaptureTime ON dbo.IndexFragmentation (ServerName, CaptureTime DESC);
+PRINT 'Table IndexFragmentation created.';
+END
+ELSE
+BEGIN
+PRINT 'Table IndexFragmentation already exists.';
+END
+GO
+
+-- Table to store disk space and database file growth info
+IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[DiskSpaceAndGrowth]') AND type in (N'U'))
+BEGIN
+CREATE TABLE [dbo].[DiskSpaceAndGrowth](
+    [Id] BIGINT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+    [ServerName] NVARCHAR(128) NOT NULL,
+    [CaptureTime] DATETIMEOFFSET(7) DEFAULT SYSDATETIMEOFFSET() NOT NULL,
+    [DriveLetter] NVARCHAR(10) NULL,
+    [FreeSpaceGB] DECIMAL(18, 2) NULL,
+    [DatabaseName] NVARCHAR(128) NULL,
+    [LogicalFileName] NVARCHAR(128) NULL,
+    [PhysicalFileName] NVARCHAR(260) NULL,
+    [CurrentSizeMB] BIGINT NULL,
+    [MaxSizeMB] NVARCHAR(50) NULL, -- Can be 'Unlimited'
+    [GrowthSetting] NVARCHAR(50) NULL,
+    [LastGrowthEventTime] DATETIMEOFFSET(7) NULL,
+    [GrowthAmountMB] DECIMAL(18,2) NULL -- Amount grown in MB if detected
+);
+CREATE INDEX IX_DSG_ServerName_CaptureTime ON dbo.DiskSpaceAndGrowth (ServerName, CaptureTime DESC);
+PRINT 'Table DiskSpaceAndGrowth created.';
+END
+ELSE
+BEGIN
+PRINT 'Table DiskSpaceAndGrowth already exists.';
+END
+GO
+
+-- Table to store SQL Agent Job status
+IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[AgentJobStatus]') AND type in (N'U'))
+BEGIN
+CREATE TABLE [dbo].[AgentJobStatus](
+    [JobStatusId] BIGINT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+    [ServerName] NVARCHAR(128) NOT NULL,
+    [CaptureTime] DATETIMEOFFSET(7) DEFAULT SYSDATETIMEOFFSET() NOT NULL,
+    [JobName] NVARCHAR(128) NOT NULL,
+    [IsEnabled] BIT NOT NULL,
+    [LastRunDate] DATE NULL,
+    [LastRunTime] TIME(0) NULL,
+    [LastRunDurationSeconds] INT NULL,
+    [LastRunStatus] NVARCHAR(50) NULL, -- Succeeded, Failed, etc.
+    [LastRunMessage] NVARCHAR(MAX) NULL,
+    [CurrentRunDurationMinutes] INT NULL -- For currently running jobs
+);
+CREATE INDEX IX_AJS_ServerName_CaptureTime ON dbo.AgentJobStatus (ServerName, CaptureTime DESC);
+PRINT 'Table AgentJobStatus created.';
+END
+ELSE
+BEGIN
+PRINT 'Table AgentJobStatus already exists.';
+END
+GO
+
+-- Table to store Database Backup Status
+IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[BackupStatus]') AND type in (N'U'))
+BEGIN
+CREATE TABLE [dbo].[BackupStatus](
+    [BackupStatusId] BIGINT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+    [ServerName] NVARCHAR(128) NOT NULL,
+    [CaptureTime] DATETIMEOFFSET(7) DEFAULT SYSDATETIMEOFFSET() NOT NULL,
+    [DatabaseName] NVARCHAR(128) NOT NULL,
+    [RecoveryModel] NVARCHAR(50) NOT NULL,
+    [LastFullBackupDate] DATETIME NULL,
+    [LastDifferentialBackupDate] DATETIME NULL,
+    [LastLogBackupDate] DATETIME NULL
+);
+CREATE INDEX IX_BS_ServerName_CaptureTime ON dbo.BackupStatus (ServerName, CaptureTime DESC);
+PRINT 'Table BackupStatus created.';
+END
+ELSE
+BEGIN
+PRINT 'Table BackupStatus already exists.';
+END
+GO
+
+-- Table to store Long Running Transactions
+IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[LongRunningTransactions]') AND type in (N'U'))
+BEGIN
+CREATE TABLE [dbo].[LongRunningTransactions](
+    [TransactionId] BIGINT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+    [ServerName] NVARCHAR(128) NOT NULL,
+    [CaptureTime] DATETIMEOFFSET(7) DEFAULT SYSDATETIMEOFFSET() NOT NULL,
+    [SessionId] INT NOT NULL,
+    [LoginName] NVARCHAR(128) NOT NULL,
+    [HostName] NVARCHAR(128) NULL,
+    [ProgramName] NVARCHAR(128) NULL,
+    [DatabaseName] NVARCHAR(128) NOT NULL,
+    [SqlTransactionId] BIGINT NOT NULL, -- SQL's transaction_id
+    [TransactionBeginTime] DATETIMEOFFSET(7) NOT NULL,
+    [TransactionAgeMinutes] INT NOT NULL,
+    [TransactionType] NVARCHAR(50) NOT NULL,
+    [TransactionState] NVARCHAR(50) NOT NULL,
+    [CurrentStatementText] NVARCHAR(MAX) NULL
+);
+CREATE INDEX IX_LRT_ServerName_CaptureTime ON dbo.LongRunningTransactions (ServerName, CaptureTime DESC);
+PRINT 'Table LongRunningTransactions created.';
+END
+ELSE
+BEGIN
+PRINT 'Table LongRunningTransactions already exists.';
+END
+GO
+
+-- Table to store Orphaned Users
+IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[OrphanedUsers]') AND type in (N'U'))
+BEGIN
+CREATE TABLE [dbo].[OrphanedUsers](
+    [OrphanId] BIGINT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+    [ServerName] NVARCHAR(128) NOT NULL,
+    [CaptureTime] DATETIMEOFFSET(7) DEFAULT SYSDATETIMEOFFSET() NOT NULL,
+    [DatabaseName] NVARCHAR(128) NOT NULL,
+    [DatabaseUserName] NVARCHAR(128) NOT NULL,
+    [UserSID] VARBINARY(85) NOT NULL
+);
+CREATE INDEX IX_OU_ServerName_CaptureTime ON dbo.OrphanedUsers (ServerName, CaptureTime DESC);
+PRINT 'Table OrphanedUsers created.';
+END
+ELSE
+BEGIN
+PRINT 'Table OrphanedUsers already exists.';
+END
+GO
+
+-- Table to store Server Role Audits
+IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[ServerRoleAudit]') AND type in (N'U'))
+BEGIN
+CREATE TABLE [dbo].[ServerRoleAudit](
+    [RoleId] BIGINT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+    [ServerName] NVARCHAR(128) NOT NULL,
+    [CaptureTime] DATETIMEOFFSET(7) DEFAULT SYSDATETIMEOFFSET() NOT NULL,
+    [LoginName] NVARCHAR(128) NOT NULL,
+    [LoginType] NVARCHAR(50) NOT NULL,
+    [ServerRoleName] NVARCHAR(128) NOT NULL
+);
+CREATE INDEX IX_SRA_ServerName_CaptureTime ON dbo.ServerRoleAudit (ServerName, CaptureTime DESC);
+PRINT 'Table ServerRoleAudit created.';
+END
+ELSE
+BEGIN
+PRINT 'Table ServerRoleAudit already exists.';
+END
+GO
+
+-- Table to store Duplicate Indexes
+IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[DuplicateIndexes]') AND type in (N'U'))
+BEGIN
+CREATE TABLE [dbo].[DuplicateIndexes](
+    [DuplicateId] BIGINT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+    [ServerName] NVARCHAR(128) NOT NULL,
+    [CaptureTime] DATETIMEOFFSET(7) DEFAULT SYSDATETIMEOFFSET() NOT NULL,
+    [DatabaseName] NVARCHAR(128) NOT NULL,
+    [SchemaName] NVARCHAR(128) NOT NULL,
+    [TableName] NVARCHAR(128) NOT NULL,
+    [KeyColumns] NVARCHAR(MAX) NOT NULL,
+    [IncludedColumns] NVARCHAR(MAX) NULL,
+    [NumberOfDuplicates] INT NOT NULL,
+    [DuplicateIndexesList] NVARCHAR(MAX) NOT NULL -- Comma-separated list of duplicate index names
+);
+CREATE INDEX IX_DI_ServerName_CaptureTime ON dbo.DuplicateIndexes (ServerName, CaptureTime DESC);
+PRINT 'Table DuplicateIndexes created.';
+END
+ELSE
+BEGIN
+PRINT 'Table DuplicateIndexes already exists.';
+END
+GO
+
+-- Table to store anomaly detection results (from Python)
+IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[LoginAnomalies]') AND type in (N'U'))
+BEGIN
+CREATE TABLE [dbo].[LoginAnomalies](
+    [AnomalyId] BIGINT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+    [ServerName] NVARCHAR(128) NOT NULL,
+    [AnomalyTime] DATETIMEOFFSET(7) DEFAULT SYSDATETIMEOFFSET() NOT NULL,
+    [UserName] NVARCHAR(128) NULL,
+    [LoginCount] INT NULL,
+    [AvgTimeBetweenLoginsSeconds] DECIMAL(18,2) NULL,
+    [Hour] INT NULL,
+    [DayOfWeek] INT NULL,
+    [AnomalyMessage] NVARCHAR(MAX) NOT NULL
+);
+CREATE INDEX IX_LA_ServerName_AnomalyTime ON dbo.LoginAnomalies (ServerName, AnomalyTime DESC);
+PRINT 'Table LoginAnomalies created.';
+END
+ELSE
+BEGIN
+PRINT 'Table LoginAnomalies already exists.';
+END
+GO
