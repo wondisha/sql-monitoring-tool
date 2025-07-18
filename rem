@@ -1,0 +1,57 @@
+-- This script will be executed by your SQL Server Agent Job.
+-- It does NOT need a USE statement at the top, as it operates across databases.
+
+DECLARE @Username NVARCHAR(128), @DatabaseName NVARCHAR(128);
+DECLARE @sql NVARCHAR(MAX);
+
+-- Declare the cursor to select records from the central AdminDB.dbo.TempAccessRequests table
+-- Using a three-part name: [DatabaseName].[SchemaName].[TableName]
+DECLARE access_cursor CURSOR FOR
+SELECT Username, DatabaseName
+FROM AdminDB.dbo.TempAccessRequests
+WHERE ExpiresAt <= GETDATE() AND AccessRevoked = 0; -- Only process unrevoked entries
+
+OPEN access_cursor;
+
+FETCH NEXT FROM access_cursor INTO @Username, @DatabaseName;
+
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    -- Construct the dynamic SQL to switch to the target database and revoke the role
+    -- This ensures the sp_droprolemember command runs in the correct database context.
+    SET @sql = 'USE [' + @DatabaseName + ']; ' +
+               'IF IS_ROLEMEMBER(N''db_datareader'', N''' + @Username + ''') = 1 ' +
+               'BEGIN ' +
+               '    EXEC sp_droprolemember N''db_datareader'', N''' + @Username + '''; ' +
+               '    PRINT ''Role db_datareader revoked from ' + @Username + ' in ' + @DatabaseName + '.''; ' +
+               'END ' +
+               'ELSE ' +
+               'BEGIN ' +
+               '    PRINT ''User ' + @Username + ' is not a member of db_datareader in ' + @DatabaseName + ', no action needed.''; ' +
+               'END;';
+
+    -- Execute the dynamic SQL
+    BEGIN TRY
+        EXEC(@sql);
+    END TRY
+    BEGIN CATCH
+        -- Log errors if the database or user doesn't exist, etc.
+        PRINT 'Error revoking access for ' + @Username + ' in ' + @DatabaseName + ': ' + ERROR_MESSAGE();
+        -- You might want to log this to a table for review
+    END CATCH
+
+    -- Update the central AdminDB.dbo.TempAccessRequests table
+    -- Using a three-part name: [DatabaseName].[SchemaName].[TableName]
+    UPDATE AdminDB.dbo.TempAccessRequests
+    SET AccessRevoked = 1, RevokedAt = GETDATE()
+    WHERE Username = @Username
+      AND DatabaseName = @DatabaseName
+      AND AccessRevoked = 0; -- Only update if not already marked as revoked
+
+    FETCH NEXT FROM access_cursor INTO @Username, @DatabaseName;
+END;
+
+CLOSE access_cursor;
+DEALLOCATE access_cursor;
+
+PRINT 'Temporary access revocation job completed.';
