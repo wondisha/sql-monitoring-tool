@@ -1,0 +1,22 @@
+# Requires: Install-Module SqlServer
+
+$centralConnStr = "Server=CentralServer;Database=CentralDB;Integrated Security=True"
+$query = @"
+SELECT Username, InstanceName, DatabaseName
+FROM TempAccessRequests
+WHERE ExpiresAt <= GETDATE() AND AccessRevoked = 0
+"@
+$expired = Invoke-Sqlcmd -ConnectionString $centralConnStr -Query $query
+
+foreach ($row in $expired) {
+    $targetConnStr = "Server=$($row.InstanceName);Database=$($row.DatabaseName);Integrated Security=True"
+    $removeSql = "EXEC sp_droprolemember N'db_datareader', N'$($row.Username)';"
+    try {
+        Invoke-Sqlcmd -ConnectionString $targetConnStr -Query $removeSql
+        $updateSql = "UPDATE TempAccessRequests SET AccessRevoked = 1 WHERE Username = '$($row.Username)' AND InstanceName = '$($row.InstanceName)' AND DatabaseName = '$($row.DatabaseName)' AND AccessRevoked = 0"
+        Invoke-Sqlcmd -ConnectionString $centralConnStr -Query $updateSql
+    } catch {
+        Write-Host "Failed to revoke access for $($row.Username) on $($row.InstanceName)\$($row.DatabaseName)"
+        # Optionally log error or update status in DB
+    }
+}
