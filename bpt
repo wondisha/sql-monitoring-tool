@@ -1,0 +1,217 @@
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+
+ALTER PROCEDURE [dbo].[CheckSQLBestPractices]
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    -- Debug logging table
+    DECLARE @DebugLog TABLE (LogMessage NVARCHAR(MAX), LogTime DATETIME);
+
+    -- Instance-level variables
+    DECLARE @InstanceID INT, @DBID INT, @InstanceName NVARCHAR(100);
+    DECLARE @RecommendedMaxDOP INT, @LogicalProcessorsPerNUMA INT, @NUMANodeCount INT, @TotalLogicalProcessors INT, @CurrentMaxDOP INT;
+    DECLARE @CurrentCostThreshold INT, @RecommendedCostThreshold INT = 25;
+    DECLARE @MaxServerMemory BIGINT, @MinServerMemory BIGINT, @TotalPhysicalMemory BIGINT;
+    DECLARE @TempdbFileCount INT, @TempdbRecommendedFiles INT;
+    DECLARE @LatestCompatLevel INT;
+
+    -- Log start of execution
+    INSERT INTO @DebugLog (LogMessage, LogTime) VALUES ('Starting SQL Best Practices Check', GETDATE());
+
+    -- Retrieve a representative InstanceID and InstanceName
+    SELECT TOP 1 @InstanceID = InstanceID, @InstanceName = Instance
+    FROM Instances;
+
+    -- Calculate recommended MaxDOP
+    SELECT @NUMANodeCount = COUNT(DISTINCT node_id)
+    FROM sys.dm_os_nodes
+    WHERE node_state_desc = 'ONLINE' AND node_id < 64;
+
+    SELECT @TotalLogicalProcessors = cpu_count
+    FROM sys.dm_os_sys_info;
+
+    SET @LogicalProcessorsPerNUMA = CASE WHEN @NUMANodeCount > 0 THEN @TotalLogicalProcessors / @NUMANodeCount ELSE @TotalLogicalProcessors END;
+    SET @RecommendedMaxDOP = CASE WHEN @LogicalProcessorsPerNUMA <= 8 THEN @LogicalProcessorsPerNUMA ELSE 8 END;
+
+    -- Get Current MaxDOP
+    SELECT @CurrentMaxDOP = CAST(value_in_use AS INT)
+    FROM sys.configurations
+    WHERE Name = 'max degree of parallelism';
+
+    -- Get Cost Threshold for Parallelism
+    SELECT @CurrentCostThreshold = CAST(value_in_use AS INT)
+    FROM sys.configurations
+    WHERE name = 'cost threshold for parallelism';
+
+    -- Get Memory Configuration
+    SELECT @MaxServerMemory = CAST(value_in_use AS BIGINT)
+    FROM sys.configurations
+    WHERE name = 'max server memory (MB)';
+
+    SELECT @MinServerMemory = CAST(value_in_use AS BIGINT)
+    FROM sys.configurations
+    WHERE name = 'min server memory (MB)';
+
+    SELECT @TotalPhysicalMemory = total_physical_memory_kb / 1024
+    FROM sys.dm_os_sys_memory;
+
+    -- Get Tempdb File Count
+    SELECT @TempdbFileCount = COUNT(*)
+    FROM sys.master_files
+    WHERE database_id = DB_ID('tempdb') AND type = 0;
+
+    SET @TempdbRecommendedFiles = CASE WHEN @TotalLogicalProcessors <= 8 THEN @TotalLogicalProcessors ELSE 8 END;
+
+    -- Determine latest compatibility level
+    SELECT @LatestCompatLevel =
+        CASE
+            WHEN SERVERPROPERTY('ProductMajorVersion') = 16 THEN 160
+            WHEN SERVERPROPERTY('ProductMajorVersion') = 15 THEN 150
+            WHEN SERVERPROPERTY('ProductMajorVersion') = 14 THEN 140
+            WHEN SERVERPROPERTY('ProductMajorVersion') = 13 THEN 130
+            ELSE 120
+        END;
+
+    -- ====================================================================================================
+    --- Instance-Level Checks
+    -- ====================================================================================================
+
+    SET @DBID = 0;
+
+    -- MaxDOP
+    INSERT INTO @DebugLog (LogMessage, LogTime) 
+    VALUES ('Checking MaxDOP: Current=' + CAST(@CurrentMaxDOP AS NVARCHAR(10)) + ', Recommended=' + CAST(@RecommendedMaxDOP AS NVARCHAR(10)), GETDATE());
+
+    UPDATE SQLBestPracticeMonitoring
+    SET Status = 'Resolved', 
+        CurrentValue = CAST(@CurrentMaxDOP AS NVARCHAR(255)), 
+        Notes = 'MaxDOP is set as recommended.', 
+        ResolvedDate = GETDATE()
+    WHERE InstanceID = @InstanceID
+      AND DBID = @DBID
+      AND BestPracticeName = 'MaxDOP'
+      AND Status = 'Unresolved'
+      AND EXISTS (
+          SELECT 1 FROM sys.configurations 
+          WHERE Name = 'max degree of parallelism' 
+          AND CAST(value_in_use AS INT) = @RecommendedMaxDOP
+      );
+
+    INSERT INTO @DebugLog (LogMessage, LogTime) 
+    SELECT 'MaxDOP Updated: ' + CAST(@@ROWCOUNT AS NVARCHAR(10)) + ' rows', GETDATE()
+    WHERE @@ROWCOUNT > 0;
+
+    INSERT INTO SQLBestPracticeMonitoring (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+    SELECT @InstanceID, @DBID, @InstanceName, 'InstanceLevel', 'MaxDOP', 
+           CAST(@CurrentMaxDOP AS NVARCHAR(255)), 
+           CAST(@RecommendedMaxDOP AS NVARCHAR(255)), 
+           'Unresolved',
+           'MaxDOP should be set to ' + CAST(@RecommendedMaxDOP AS NVARCHAR(10)) + ' based on server configuration.'
+    WHERE NOT EXISTS (
+        SELECT 1 FROM sys.configurations 
+        WHERE Name = 'max degree of parallelism' 
+        AND CAST(value_in_use AS INT) = @RecommendedMaxDOP
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM SQLBestPracticeMonitoring
+        WHERE InstanceID = @InstanceID AND DBID = @DBID AND BestPracticeName = 'MaxDOP' AND Status = 'Unresolved'
+    );
+
+    -- Cost Threshold for Parallelism
+    UPDATE SQLBestPracticeMonitoring
+    SET Status = 'Resolved', 
+        CurrentValue = CAST(@CurrentCostThreshold AS NVARCHAR(255)), 
+        Notes = 'Cost threshold for parallelism is appropriately configured.', 
+        ResolvedDate = GETDATE()
+    WHERE InstanceID = @InstanceID
+      AND DBID = @DBID
+      AND BestPracticeName = 'CostThresholdParallelism'
+      AND Status = 'Unresolved'
+      AND EXISTS (
+          SELECT 1 FROM sys.configurations 
+          WHERE name = 'cost threshold for parallelism' 
+          AND CAST(value_in_use AS INT) >= @RecommendedCostThreshold
+      );
+
+    INSERT INTO SQLBestPracticeMonitoring (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+    SELECT @InstanceID, @DBID, @InstanceName, 'InstanceLevel', 'CostThresholdParallelism', 
+           CAST(@CurrentCostThreshold AS NVARCHAR(255)), 
+           CAST(@RecommendedCostThreshold AS NVARCHAR(255)), 
+           'Unresolved',
+           'Cost threshold for parallelism should be at least ' + CAST(@RecommendedCostThreshold AS NVARCHAR(10)) + ' for better performance.'
+    WHERE NOT EXISTS (
+        SELECT 1 FROM sys.configurations 
+        WHERE name = 'cost threshold for parallelism' 
+        AND CAST(value_in_use AS INT) >= @RecommendedCostThreshold
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM SQLBestPracticeMonitoring
+        WHERE InstanceID = @InstanceID AND DBID = @DBID AND BestPracticeName = 'CostThresholdParallelism' AND Status = 'Unresolved'
+    );
+
+    -- Max Server Memory
+    UPDATE SQLBestPracticeMonitoring
+    SET Status = 'Resolved', 
+        CurrentValue = CAST(@MaxServerMemory AS NVARCHAR(255)) + ' MB', 
+        Notes = 'Max server memory is properly configured.', 
+        ResolvedDate = GETDATE()
+    WHERE InstanceID = @InstanceID
+      AND DBID = @DBID
+      AND BestPracticeName = 'MaxServerMemory'
+      AND Status = 'Unresolved'
+      AND EXISTS (
+          SELECT 1 FROM sys.configurations 
+          WHERE name = 'max server memory (MB)' 
+          AND CAST(value_in_use AS BIGINT) != 2147483647 
+          AND CAST(value_in_use AS BIGINT) < (@TotalPhysicalMemory * 0.9)
+      );
+
+    INSERT INTO SQLBestPracticeMonitoring (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+    SELECT @InstanceID, @DBID, @InstanceName, 'InstanceLevel', 'MaxServerMemory',
+           CASE WHEN @MaxServerMemory = 2147483647 THEN 'Unlimited (Default)' ELSE CAST(@MaxServerMemory AS NVARCHAR(255)) + ' MB' END,
+           CAST(CAST(@TotalPhysicalMemory * 0.8 AS INT) AS NVARCHAR(255)) + ' MB', 
+           'Unresolved',
+           'Max server memory should be configured to leave memory for OS. Recommended: ' + CAST(CAST(@TotalPhysicalMemory * 0.8 AS INT) AS NVARCHAR(10)) + ' MB'
+    WHERE NOT EXISTS (
+        SELECT 1 FROM sys.configurations 
+        WHERE name = 'max server memory (MB)' 
+        AND CAST(value_in_use AS BIGINT) != 2147483647 
+        AND CAST(value_in_use AS BIGINT) < (@TotalPhysicalMemory * 0.9)
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM SQLBestPracticeMonitoring
+        WHERE InstanceID = @InstanceID AND DBID = @DBID AND BestPracticeName = 'MaxServerMemory' AND Status = 'Unresolved'
+    );
+
+    -- Tempdb Configuration
+    UPDATE SQLBestPracticeMonitoring
+    SET Status = 'Resolved', 
+        CurrentValue = CAST(@TempdbFileCount AS NVARCHAR(255)) + ' files', 
+        Notes = 'Tempdb has optimal number of data files.', 
+        ResolvedDate = GETDATE()
+    WHERE InstanceID = @InstanceID
+      AND DBID = @DBID
+      AND BestPracticeName = 'TempdbFileCount'
+      AND Status = 'Unresolved'
+      AND @TempdbFileCount = @TempdbRecommendedFiles;
+
+    INSERT INTO SQLBestPracticeMonitoring (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+    SELECT @InstanceID, @DBID, @InstanceName, 'InstanceLevel', 'TempdbFileCount', 
+           CAST(@TempdbFileCount AS NVARCHAR(255)) + ' files', 
+           CAST(@TempdbRecommendedFiles AS NVARCHAR(255)) + ' files', 
+           'Unresolved',
+           'Tempdb should have ' + CAST(@TempdbRecommendedFiles AS NVARCHAR(10)) + ' data files (equal to CPU cores, max 8) for optimal performance.'
+    WHERE @TempdbFileCount != @TempdbRecommendedFiles
+      AND NOT EXISTS (
+          SELECT 1 FROM SQLBestPracticeMonitoring
+          WHERE InstanceID = @InstanceID AND DBID = @DBID AND BestPracticeName = 'TempdbFileCount' AND Status = 'Unresolved'
+      );
+
+    -- Output Debug Log
+    SELECT * FROM @DebugLog ORDER BY LogTime ASC;
+END
+GO
