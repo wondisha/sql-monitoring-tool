@@ -1,0 +1,69 @@
+#region Configuration
+    $Config = @{
+        CentralDBServer = "abc"              # Central server hosting the server list
+        CentralDBName  = "db01"             # Database containing the server list
+        LogDir         = "C:\Logs\SQLGuardian"
+        ModelDir       = "C:\Models\SQLGuardian"
+        MonitoringDBServer = "abc"          # Monitoring database server
+        MonitoringDBName  = "db01"          # Monitoring database name
+        SmtpServer     = ""                 # SMTP server for alerts
+        SmtpPort       = 587                # SMTP port
+        SmtpUsername   = ""                 # SMTP username
+        SmtpPassword   = (ConvertTo-SecureString "" -AsPlainText -Force) # SMTP password
+        EmailTo        = ""                 # Alert recipient email
+        EmailFrom      = ""                 # Sender email
+    }
+
+    # Ensure LogDir exists
+    if (-not (Test-Path $Config.LogDir)) {
+        New-Item -ItemType Directory -Path $Config.LogDir -Force | Out-Null
+    }
+
+    # Fetch server list from central database and populate global ServerList
+    try {
+        $query = "SELECT name FROM db01.dbo.tbl01"
+        $connectionString = "Server=$($Config.CentralDBServer);Database=$($Config.CentralDBName);Integrated Security=True;"
+        $connection = New-Object System.Data.SqlClient.SqlConnection($connectionString)
+        $command = New-Object System.Data.SqlClient.SqlCommand($query, $connection)
+        $connection.Open()
+        $reader = $command.ExecuteReader()
+        $global:ServerList = @() # Clear any existing global ServerList
+        while ($reader.Read()) {
+            $global:ServerList += $reader["name"]
+        }
+        $reader.Close()
+        $connection.Close()
+        if ($global:ServerList.Count -eq 0) {
+            Write-Log "No servers found in $($Config.CentralDBServer).$($Config.CentralDBName).tbl01. Exiting." "ERROR"
+            exit
+        }
+        Write-Log "Retrieved $($global:ServerList.Count) servers from $($Config.CentralDBServer).$($Config.CentralDBName).tbl01: $($global:ServerList -join ', ')" "INFO"
+    } catch {
+        Write-Log "Failed to retrieve server list from $($Config.CentralDBServer).$($Config.CentralDBName).tbl01: $($_.Exception.Message)" "ERROR"
+        exit
+    }
+    #endregion
+
+    # Rest of the Start-SQLGuardian function continues as in the original script...
+    if ($Interactive) {
+        # Interactive mode logic
+        $selectedServers = $global:ServerList # Use global ServerList
+        # ... (rest of interactive mode logic unchanged)
+    } else {
+        # Automated mode logic
+        $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+        $script:agentLogFile = "$($Config.LogDir)\SQLGuardian_Agent_$timestamp.log"
+        Write-Log "SQL Guardian Monitoring started at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') for servers: $($global:ServerList -join ', ')" "INFO"
+        foreach ($ServerName in $global:ServerList) {
+            # ... (rest of automated mode logic unchanged)
+        }
+        # ...
+    }
+}
+
+# Script Execution Entry Point
+if ($Interactive) {
+    Start-SQLGuardian -Interactive
+} else {
+    Start-SQLGuardian
+}
