@@ -1,0 +1,23 @@
+$UNCPath = "\\FileServer\ShareName\BackupFolder" # Replace with your actual UNC path
+
+try {
+    # Create a DirectoryInfo object for the UNC path
+    $directory = New-Object System.IO.DirectoryInfo($UNCPath)
+
+    # The Root property gives the root of the path (e.g., \\FileServer\ShareName)
+    $root = $directory.Root
+
+    # Create a DriveInfo object from the root path
+    $drive = New-Object System.IO.DriveInfo($root.Name)
+
+    # Output the relevant properties
+    [PSCustomObject]@{
+        Path        = $UNCPath
+        TotalSizeGB = [math]::Round(($drive.TotalSize / 1GB), 2)
+        FreeSpaceGB = [math]::Round(($drive.AvailableFreeSpace / 1GB), 2)
+        UsedSpaceGB = [math]::Round((($drive.TotalSize - $drive.AvailableFreeSpace) / 1GB), 2)
+    }
+}
+catch {
+    Write-Error "Could not get capacity for $UNCPath. Error: $($_.Exception.Message)"
+}
