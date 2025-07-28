@@ -1,6 +1,5 @@
 USE [InstanceMonitor_poc]
 GO
-/****** Object:  StoredProcedure [dbo].[usp_CheckSQLBestPractices]    Script Date: 7/28/2025 2:18:31 PM ******/
 SET ANSI_NULLS ON
 GO
 SET QUOTED_IDENTIFIER ON
@@ -11,7 +10,22 @@ AS
 BEGIN
     SET NOCOUNT ON;
 
+    -------------------------------------------------------------------
+    -- Cleanup Phase: Remove stale/irrelevant records before new checks
+    -------------------------------------------------------------------
+
+    -- Remove monitoring records for servers/databases no longer in inventory
+    DELETE FROM SQLBestPracticeMonitoring
+    WHERE InstanceID NOT IN (SELECT InstanceID FROM Instances)
+       OR DBID NOT IN (SELECT DBID FROM DBInfo);
+
+    -- Optionally, remove resolved records older than 90 days
+    DELETE FROM SQLBestPracticeMonitoring
+    WHERE Status = 'Resolved' AND ResolvedDate < DATEADD(day,-90,GETDATE());
+
+    -------------------------------------------------------------------
     -- Debug log table
+    -------------------------------------------------------------------
     DECLARE @DebugLog TABLE (LogMessage NVARCHAR(MAX), LogTime DATETIME);
 
     -- Instance-level variables
@@ -86,6 +100,9 @@ BEGIN
             -- Instance-Level Checks
 
             -- MaxDOP
+            SET @BestPracticeID = NULL
+            SELECT @BestPracticeID = bestpracticeid FROM dbo.BestPractices WHERE BestPracticeName = 'MaxDOP';
+
             UPDATE SQLBestPracticeMonitoring
             SET Status = 'Resolved', 
                 CurrentValue = CAST(@CurrentMaxDOP AS NVARCHAR(255)), 
@@ -95,11 +112,7 @@ BEGIN
               AND DBID = 0
               AND BestPracticeName = 'MaxDOP'
               AND Status = 'Unresolved'
-              AND EXISTS (
-                  SELECT 1 FROM sys.configurations 
-                  WHERE Name = 'max degree of parallelism' 
-                  AND CAST(value_in_use AS INT) = @RecommendedMaxDOP
-              );
+              AND CAST(@CurrentMaxDOP AS NVARCHAR(255)) = CAST(@RecommendedMaxDOP AS NVARCHAR(255));
 
             INSERT INTO SQLBestPracticeMonitoring (BestPracticeID,InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
             SELECT @BestPracticeID,@InstanceID, 0, @InstanceName, 'InstanceLevel', 'MaxDOP', 
@@ -107,17 +120,16 @@ BEGIN
                    CAST(@RecommendedMaxDOP AS NVARCHAR(255)), 
                    'Unresolved',
                    'MaxDOP should be set to ' + CAST(@RecommendedMaxDOP AS NVARCHAR(10)) + ' based on server configuration.'
-            WHERE NOT EXISTS (
-                SELECT 1 FROM sys.configurations 
-                WHERE Name = 'max degree of parallelism' 
-                AND CAST(value_in_use AS INT) = @RecommendedMaxDOP
-            )
-            AND NOT EXISTS (
+            WHERE CAST(@CurrentMaxDOP AS NVARCHAR(255)) <> CAST(@RecommendedMaxDOP AS NVARCHAR(255))
+              AND NOT EXISTS (
                 SELECT 1 FROM SQLBestPracticeMonitoring
                 WHERE InstanceID = @InstanceID AND DBID = 0 AND BestPracticeName = 'MaxDOP' AND Status = 'Unresolved'
             );
 
             -- Cost Threshold for Parallelism
+            SET @BestPracticeID = NULL
+            SELECT @BestPracticeID = bestpracticeid FROM dbo.BestPractices WHERE BestPracticeName = 'CostThresholdParallelism';
+
             UPDATE SQLBestPracticeMonitoring
             SET Status = 'Resolved', 
                 CurrentValue = CAST(@CurrentCostThreshold AS NVARCHAR(255)), 
@@ -127,11 +139,7 @@ BEGIN
               AND DBID = 0
               AND BestPracticeName = 'CostThresholdParallelism'
               AND Status = 'Unresolved'
-              AND EXISTS (
-                  SELECT 1 FROM sys.configurations 
-                  WHERE name = 'cost threshold for parallelism' 
-                  AND CAST(value_in_use AS INT) >= @RecommendedCostThreshold
-              );
+              AND CAST(@CurrentCostThreshold AS NVARCHAR(255)) >= CAST(@RecommendedCostThreshold AS NVARCHAR(255));
 
             INSERT INTO SQLBestPracticeMonitoring (BestPracticeID,InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
             SELECT @BestPracticeID,@InstanceID, 0, @InstanceName, 'InstanceLevel', 'CostThresholdParallelism', 
@@ -139,17 +147,16 @@ BEGIN
                    CAST(@RecommendedCostThreshold AS NVARCHAR(255)), 
                    'Unresolved',
                    'Cost threshold for parallelism should be at least ' + CAST(@RecommendedCostThreshold AS NVARCHAR(10)) + ' for better performance.'
-            WHERE NOT EXISTS (
-                SELECT 1 FROM sys.configurations 
-                WHERE name = 'cost threshold for parallelism' 
-                AND CAST(value_in_use AS INT) >= @RecommendedCostThreshold
-            )
-            AND NOT EXISTS (
+            WHERE CAST(@CurrentCostThreshold AS NVARCHAR(255)) < CAST(@RecommendedCostThreshold AS NVARCHAR(255))
+              AND NOT EXISTS (
                 SELECT 1 FROM SQLBestPracticeMonitoring
                 WHERE InstanceID = @InstanceID AND DBID = 0 AND BestPracticeName = 'CostThresholdParallelism' AND Status = 'Unresolved'
             );
 
             -- Max Server Memory
+            SET @BestPracticeID = NULL
+            SELECT @BestPracticeID = bestpracticeid FROM dbo.BestPractices WHERE BestPracticeName = 'MaxServerMemory';
+
             UPDATE SQLBestPracticeMonitoring
             SET Status = 'Resolved', 
                 CurrentValue = CAST(@MaxServerMemory AS NVARCHAR(255)) + ' MB', 
@@ -159,12 +166,8 @@ BEGIN
               AND DBID = 0
               AND BestPracticeName = 'MaxServerMemory'
               AND Status = 'Unresolved'
-              AND EXISTS (
-                  SELECT 1 FROM sys.configurations 
-                  WHERE name = 'max server memory (MB)' 
-                  AND CAST(value_in_use AS BIGINT) != 2147483647 
-                  AND CAST(value_in_use AS BIGINT) < (@TotalPhysicalMemory * 0.9)
-              );
+              AND @MaxServerMemory != 2147483647
+              AND @MaxServerMemory < (@TotalPhysicalMemory * 0.9);
 
             INSERT INTO SQLBestPracticeMonitoring (BestPracticeID,InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
             SELECT @BestPracticeID,@InstanceID, 0, @InstanceName, 'InstanceLevel', 'MaxServerMemory',
@@ -172,18 +175,17 @@ BEGIN
                    CAST(CAST(@TotalPhysicalMemory * 0.8 AS INT) AS NVARCHAR(255)) + ' MB', 
                    'Unresolved',
                    'Max server memory should be configured to leave memory for OS. Recommended: ' + CAST(CAST(@TotalPhysicalMemory * 0.8 AS INT) AS NVARCHAR(10)) + ' MB'
-            WHERE NOT EXISTS (
-                SELECT 1 FROM sys.configurations 
-                WHERE name = 'max server memory (MB)' 
-                AND CAST(value_in_use AS BIGINT) != 2147483647 
-                AND CAST(value_in_use AS BIGINT) < (@TotalPhysicalMemory * 0.9)
-            )
-            AND NOT EXISTS (
+            WHERE 
+                (@MaxServerMemory = 2147483647 OR @MaxServerMemory >= (@TotalPhysicalMemory * 0.9))
+              AND NOT EXISTS (
                 SELECT 1 FROM SQLBestPracticeMonitoring
                 WHERE InstanceID = @InstanceID AND DBID = 0 AND BestPracticeName = 'MaxServerMemory' AND Status = 'Unresolved'
             );
 
             -- Tempdb Configuration
+            SET @BestPracticeID = NULL
+            SELECT @BestPracticeID = bestpracticeid FROM dbo.BestPractices WHERE BestPracticeName = 'TempdbFileCount';
+
             UPDATE SQLBestPracticeMonitoring
             SET Status = 'Resolved', 
                 CurrentValue = CAST(@TempdbFileCount AS NVARCHAR(255)) + ' files', 
@@ -241,6 +243,9 @@ BEGIN
         BEGIN
             BEGIN TRY
                 -- Page Verify Check
+                SET @BestPracticeID = NULL
+                SELECT @BestPracticeID = bestpracticeid FROM dbo.BestPractices WHERE BestPracticeName = 'PageVerify';
+
                 UPDATE SQLBestPracticeMonitoring
                 SET Status = 'Resolved', 
                     CurrentValue = 'CHECKSUM', 
@@ -266,6 +271,9 @@ BEGIN
                   );
 
                 -- Recovery Model Check
+                SET @BestPracticeID = NULL
+                SELECT @BestPracticeID = bestpracticeid FROM dbo.BestPractices WHERE BestPracticeName = 'RecoveryModel';
+
                 UPDATE SQLBestPracticeMonitoring
                 SET Status = 'Resolved',
                     CurrentValue = 'FULL',
@@ -336,3 +344,4 @@ BEGIN
 
     PRINT 'SQL Best Practices Check Completed at ' + CONVERT(NVARCHAR(30), GETDATE(), 120);
 END
+GO
