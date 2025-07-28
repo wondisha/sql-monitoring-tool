@@ -1,21 +1,39 @@
-$UNCPath = "\\FileServer\ShareName\BackupFolder" # Replace with your actual UNC path
+$UNCPath = "\\abc\sqlbackups" # Replace with your actual UNC path
 
 try {
-    # Create a DirectoryInfo object for the UNC path
-    $directory = New-Object System.IO.DirectoryInfo($UNCPath)
+    # 1. Extract the file server name from the UNC path
+    $FileServerName = $UNCPath.Split('\')[2] # Gets 'abc' from '\\abc\sqlbackups'
 
-    # The Root property gives the root of the path (e.g., \\FileServer\ShareName)
-    $root = $directory.Root
+    # 2. Get the share name (the specific shared folder name)
+    #    This gets 'sqlbackups' from '\\abc\sqlbackups'
+    $ShareName = $UNCPath.Split('\')[3]
 
-    # Create a DriveInfo object from the root path
-    $drive = New-Object System.IO.DriveInfo($root.Name)
+    # 3. Get information about the share on the file server
+    #    Win32_Share provides the Path (e.g., 'D:\SQLBackups') of the shared folder
+    $shareInfo = Get-WmiObject -Class Win32_Share -ComputerName $FileServerName -Filter "Name='$ShareName'" -ErrorAction Stop
 
-    # Output the relevant properties
-    [PSCustomObject]@{
-        Path        = $UNCPath
-        TotalSizeGB = [math]::Round(($drive.TotalSize / 1GB), 2)
-        FreeSpaceGB = [math]::Round(($drive.AvailableFreeSpace / 1GB), 2)
-        UsedSpaceGB = [math]::Round((($drive.TotalSize - $drive.AvailableFreeSpace) / 1GB), 2)
+    if ($shareInfo) {
+        # 4. Extract the drive letter from the share's path (e.g., 'D:' from 'D:\SQLBackups')
+        $ShareDriveLetter = $shareInfo.Path.Substring(0, 2) # Gets 'D:'
+
+        # 5. Get the FreeSpace and Size of that specific logical disk on the file server
+        $driveInfo = Get-WmiObject -Class Win32_LogicalDisk -ComputerName $FileServerName -Filter "DeviceID='$ShareDriveLetter'" -ErrorAction Stop
+
+        if ($driveInfo) {
+            [PSCustomObject]@{
+                UNCPath     = $UNCPath
+                FileServer  = $FileServerName
+                ShareName   = $ShareName
+                HostDrive   = $ShareDriveLetter
+                TotalSizeGB = [math]::Round(($driveInfo.Size / 1GB), 2)
+                FreeSpaceGB = [math]::Round(($driveInfo.FreeSpace / 1GB), 2)
+                UsedSpaceGB = [math]::Round((($driveInfo.Size - $driveInfo.FreeSpace) / 1GB), 2)
+            }
+        } else {
+            Write-Warning "Could not find drive information for '$ShareDriveLetter' on '$FileServerName'."
+        }
+    } else {
+        Write-Warning "Could not find share '$ShareName' on '$FileServerName'. Check the UNC path."
     }
 }
 catch {
