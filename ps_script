@@ -16,7 +16,7 @@
     SQLBestPracticeMonitoringErrors) are located.
 .PARAMETER InstanceListTable
     The name of the table on the central server that contains the list of instances
-    to be checked. Default is 'abc.dbo.instance'.
+    to be checked. Format should be 'Schema.TableName' (e.g., 'dbo.sqlinstancemonitor').
 
 .EXAMPLE
     .\Invoke-DbaBestPracticesCheck.ps1 -CentralServer "MONITORING_SQL" -MonitoringDb "InstanceMonitor_poc"
@@ -33,14 +33,14 @@
 param(
     [string]$CentralServer = "YourCentralSqlServer",
     [string]$MonitoringDb = "InstanceMonitor_poc",
-    [string]$InstanceListTable = "abc.dbo.instance"
+    [string]$InstanceListTable = "dbo.sqlinstancemonitor"
 )
 
 # --- Configuration Section ---
-# Update these variables for your environment if not using parameters
+# You can uncomment and modify these lines if you prefer to set values directly in the script.
 # $CentralServer = "YourCentralSqlServer"
 # $MonitoringDb = "InstanceMonitor_poc"
-# $InstanceListTable = "abc.dbo.instance"
+# $InstanceListTable = "dbo.sqlinstancemonitor"
 
 # --- Requirements and Module Check ---
 Write-Host "Checking for dbatools module..."
@@ -53,18 +53,20 @@ if (-not (Get-Module -ListAvailable -Name dbatools)) {
 # --- Cleanup Phase (Executed once on the central server) ---
 Write-Host "Performing cleanup of stale records..."
 $cleanupQuery = @"
-    DELETE FROM SQLBestPracticeMonitoring WHERE InstanceID NOT IN (SELECT InstanceID FROM Instances);
-    DELETE FROM SQLBestPracticeMonitoring WHERE Status = 'Resolved' AND ResolvedDate < DATEADD(day,-90,GETDATE());
+    DELETE FROM dbo.SQLBestPracticeMonitoring WHERE InstanceID NOT IN (SELECT InstanceID FROM dbo.Instances);
+    DELETE FROM dbo.SQLBestPracticeMonitoring WHERE Status = 'Resolved' AND ResolvedDate < DATEADD(day,-90,GETDATE());
 "@
 Invoke-DbaQuery -SqlInstance $CentralServer -Database $MonitoringDb -Query $cleanupQuery
 
 # --- Get the list of instances to check ---
 Write-Host "Retrieving instance list from $CentralServer..."
-$instanceQuery = "SELECT InstanceName FROM $InstanceListTable"
+# The query uses a two-part name (schema.table) because Invoke-DbaQuery's -Database parameter
+# already sets the database context.
+$instanceQuery = "SELECT InstanceName FROM [$InstanceListTable] WHERE IsActive = 1"
 $instances = Invoke-DbaQuery -SqlInstance $CentralServer -Database $MonitoringDb -Query $instanceQuery | Select-Object -ExpandProperty InstanceName
 
 if (-not $instances) {
-    Write-Host "No instances found in the list. Exiting." -ForegroundColor Yellow
+    Write-Host "No instances found in the list. Please check your '$InstanceListTable' table." -ForegroundColor Yellow
     exit
 }
 
@@ -79,9 +81,7 @@ foreach ($instance in $instances) {
         $maxdop = (Get-DbaSpConfigure -SqlInstance $instance -Name 'max degree of parallelism').ConfigValue
         $costThreshold = (Get-DbaSpConfigure -SqlInstance $instance -Name 'cost threshold for parallelism').ConfigValue
         
-        # NOTE: The T-SQL SP calculates recommended values dynamically.
-        # This script uses hardcoded values as a simple example. For a more
-        # robust check, you would need to calculate these values in PowerShell.
+        # Determine the status using a PowerShell-compatible if/else block
         $maxdopStatus = "Unresolved"
         if ($maxdop -eq 8) { $maxdopStatus = "Resolved" }
         
@@ -90,7 +90,7 @@ foreach ($instance in $instances) {
 
         # Update MaxDOP
         $updateMaxdop = @"
-            UPDATE SQLBestPracticeMonitoring
+            UPDATE dbo.SQLBestPracticeMonitoring
             SET CurrentValue = '$maxdop', Status = '$maxdopStatus',
                 Notes = 'Checked by dbatools',
                 ResolvedDate = CASE WHEN '$maxdopStatus' = 'Resolved' THEN GETDATE() ELSE NULL END
@@ -100,7 +100,7 @@ foreach ($instance in $instances) {
 
         # Update Cost Threshold
         $updateCostThreshold = @"
-            UPDATE SQLBestPracticeMonitoring
+            UPDATE dbo.SQLBestPracticeMonitoring
             SET CurrentValue = '$costThreshold', Status = '$costThresholdStatus',
                 Notes = 'Checked by dbatools',
                 ResolvedDate = CASE WHEN '$costThresholdStatus' = 'Resolved' THEN GETDATE() ELSE NULL END
@@ -125,7 +125,7 @@ foreach ($instance in $instances) {
             $autoShrinkStatus = "Unresolved"
             if (-not $autoshrink) { $autoShrinkStatus = "Resolved" }
             $updateAutoShrink = @"
-                UPDATE SQLBestPracticeMonitoring
+                UPDATE dbo.SQLBestPracticeMonitoring
                 SET CurrentValue = '$autoShrinkValue', Status = '$autoShrinkStatus',
                     Notes = 'Checked by dbatools', ResolvedDate = CASE WHEN '$autoShrinkStatus' = 'Resolved' THEN GETDATE() ELSE NULL END
                 WHERE InstanceName = '$instance' AND DatabaseName = '$dbName' AND BestPracticeName = 'AutoShrink';
@@ -134,7 +134,7 @@ foreach ($instance in $instances) {
 
             # Update Recovery Model
             $updateRecovery = @"
-                UPDATE SQLBestPracticeMonitoring
+                UPDATE dbo.SQLBestPracticeMonitoring
                 SET CurrentValue = '$recovery', Status = CASE WHEN '$recovery' = 'FULL' THEN 'Resolved' ELSE 'Unresolved' END,
                     Notes = 'Checked by dbatools', ResolvedDate = CASE WHEN '$recovery' = 'FULL' THEN GETDATE() ELSE NULL END
                 WHERE InstanceName = '$instance' AND DatabaseName = '$dbName' AND BestPracticeName = 'RecoveryModel';
@@ -143,7 +143,7 @@ foreach ($instance in $instances) {
 
             # Update Page Verify
             $updatePageVerify = @"
-                UPDATE SQLBestPracticeMonitoring
+                UPDATE dbo.SQLBestPracticeMonitoring
                 SET CurrentValue = '$pageVerify', Status = CASE WHEN '$pageVerify' = 'CHECKSUM' THEN 'Resolved' ELSE 'Unresolved' END,
                     Notes = 'Checked by dbatools', ResolvedDate = CASE WHEN '$pageVerify' = 'CHECKSUM' THEN GETDATE() ELSE NULL END
                 WHERE InstanceName = '$instance' AND DatabaseName = '$dbName' AND BestPracticeName = 'PageVerify';
@@ -156,7 +156,7 @@ foreach ($instance in $instances) {
             $trustworthyStatus = "Unresolved"
             if (-not $trustworthy) { $trustworthyStatus = "Resolved" }
             $updateTrustworthy = @"
-                UPDATE SQLBestPracticeMonitoring
+                UPDATE dbo.SQLBestPracticeMonitoring
                 SET CurrentValue = '$trustworthyValue', Status = '$trustworthyStatus',
                     Notes = 'Checked by dbatools', ResolvedDate = CASE WHEN '$trustworthyStatus' = 'Resolved' THEN GETDATE() ELSE NULL END
                 WHERE InstanceName = '$instance' AND DatabaseName = '$dbName' AND BestPracticeName = 'Trustworthy';
@@ -167,7 +167,7 @@ foreach ($instance in $instances) {
             $lastFullBackupStatus = "Unresolved"
             if ($lastFullBackup -and ( (Get-Date) - $lastFullBackup).TotalHours -le 24) { $lastFullBackupStatus = "Resolved" }
             $updateLastFullBackup = @"
-                UPDATE SQLBestPracticeMonitoring
+                UPDATE dbo.SQLBestPracticeMonitoring
                 SET CurrentValue = '$lastFullBackup', Status = '$lastFullBackupStatus',
                     Notes = 'Checked by dbatools', ResolvedDate = CASE WHEN '$lastFullBackupStatus' = 'Resolved' THEN GETDATE() ELSE NULL END
                 WHERE InstanceName = '$instance' AND DatabaseName = '$dbName' AND BestPracticeName = 'LastFullBackup';
@@ -180,7 +180,7 @@ foreach ($instance in $instances) {
         $fileCount = $tempdbFiles.Count
         
         $updateTempdb = @"
-            UPDATE SQLBestPracticeMonitoring
+            UPDATE dbo.SQLBestPracticeMonitoring
             SET CurrentValue = '$fileCount', Status = CASE WHEN $fileCount -ge 4 THEN 'Resolved' ELSE 'Unresolved' END,
                 Notes = 'Checked by dbatools', ResolvedDate = CASE WHEN $fileCount -ge 4 THEN GETDATE() ELSE NULL END
             WHERE InstanceName = '$instance' AND DatabaseName = 'tempdb' AND BestPracticeName = 'TempdbFileCount';
@@ -190,10 +190,10 @@ foreach ($instance in $instances) {
     } catch {
         $errorMsg = $_.Exception.Message.Replace("'", "''")
         $logQuery = @"
-            INSERT INTO SQLBestPracticeMonitoringErrors (InstanceID, DatabaseName, BestPracticeName, ErrorMessage, LogTime)
+            INSERT INTO dbo.SQLBestPracticeMonitoringErrors (InstanceName, DatabaseName, BestPracticeName, ErrorMessage, LogTime)
             VALUES (
-                (SELECT InstanceID FROM Instances WHERE InstanceName = '$instance'),
                 '$instance',
+                '$MonitoringDb',
                 'BestPracticeCheck',
                 '$errorMsg',
                 GETDATE()
