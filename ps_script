@@ -1,0 +1,199 @@
+<#
+.SYNOPSIS
+    Performs a best practices check across multiple SQL Server instances
+    using the dbatools module and logs the results to a central monitoring database.
+
+.DESCRIPTION
+    This script connects to a central monitoring server to get a list of
+    SQL Server instances. It then loops through each instance, uses dbatools
+    cmdlets to check various best practices (e.g., MaxDOP, Recovery Model),
+    and logs the findings back to the central server's monitoring tables.
+
+.PARAMETER CentralServer
+    The name of the SQL Server instance hosting the central monitoring database.
+.PARAMETER MonitoringDb
+    The name of the database where the monitoring tables (SQLBestPracticeMonitoring,
+    SQLBestPracticeMonitoringErrors) are located.
+.PARAMETER InstanceListTable
+    The name of the table on the central server that contains the list of instances
+    to be checked. Default is 'abc.dbo.instance'.
+
+.EXAMPLE
+    .\Invoke-DbaBestPracticesCheck.ps1 -CentralServer "MONITORING_SQL" -MonitoringDb "InstanceMonitor_poc"
+
+    This will run the checks for all instances listed in the default table on
+    the 'MONITORING_SQL' server.
+
+.NOTES
+    - This script requires the 'dbatools' PowerShell module.
+    - It must be run with an account that has access to both the central
+      monitoring server and all target SQL Server instances.
+#>
+param(
+    [string]$CentralServer = "YourCentralSqlServer",
+    [string]$MonitoringDb = "InstanceMonitor_poc",
+    [string]$InstanceListTable = "abc.dbo.instance"
+)
+
+# --- Configuration Section ---
+# Update these variables for your environment if not using parameters
+# $CentralServer = "YourCentralSqlServer"
+# $MonitoringDb = "InstanceMonitor_poc"
+# $InstanceListTable = "abc.dbo.instance"
+
+# --- Requirements and Module Check ---
+Write-Host "Checking for dbatools module..."
+if (-not (Get-Module -ListAvailable -Name dbatools)) {
+    Write-Host "The 'dbatools' module is not installed." -ForegroundColor Red
+    Write-Host "Please install it with: Install-Module -Name dbatools -Scope CurrentUser" -ForegroundColor Yellow
+    exit
+}
+
+# --- Cleanup Phase (Executed once on the central server) ---
+Write-Host "Performing cleanup of stale records..."
+$cleanupQuery = @"
+    DELETE FROM SQLBestPracticeMonitoring WHERE InstanceID NOT IN (SELECT InstanceID FROM Instances);
+    DELETE FROM SQLBestPracticeMonitoring WHERE Status = 'Resolved' AND ResolvedDate < DATEADD(day,-90,GETDATE());
+"@
+Invoke-DbaQuery -SqlInstance $CentralServer -Database $MonitoringDb -Query $cleanupQuery
+
+# --- Get the list of instances to check ---
+Write-Host "Retrieving instance list from $CentralServer..."
+$instanceQuery = "SELECT InstanceName FROM $InstanceListTable"
+$instances = Invoke-DbaQuery -SqlInstance $CentralServer -Database $MonitoringDb -Query $instanceQuery | Select-Object -ExpandProperty InstanceName
+
+if (-not $instances) {
+    Write-Host "No instances found in the list. Exiting." -ForegroundColor Yellow
+    exit
+}
+
+Write-Host "Found $($instances.Count) instances to check. Starting analysis..."
+
+# --- Main loop to check each instance ---
+foreach ($instance in $instances) {
+    Write-Host "Checking instance: $instance" -ForegroundColor Green
+
+    try {
+        # --- Instance-level checks ---
+        $maxdop = (Get-DbaSpConfigure -SqlInstance $instance -Name 'max degree of parallelism').ConfigValue
+        $costThreshold = (Get-DbaSpConfigure -SqlInstance $instance -Name 'cost threshold for parallelism').ConfigValue
+        
+        # NOTE: The T-SQL SP calculates recommended values dynamically.
+        # This script uses hardcoded values as a simple example. For a more
+        # robust check, you would need to calculate these values in PowerShell.
+        $maxdopStatus = if ($maxdop -eq 8) { "Resolved" } else { "Unresolved" }
+        $costThresholdStatus = if ($costThreshold -ge 50) { "Resolved" } else { "Unresolved" }
+
+        # Update MaxDOP
+        $updateMaxdop = @"
+            UPDATE SQLBestPracticeMonitoring
+            SET CurrentValue = '$maxdop', Status = '$maxdopStatus',
+                Notes = 'Checked by dbatools',
+                ResolvedDate = CASE WHEN '$maxdopStatus' = 'Resolved' THEN GETDATE() ELSE NULL END
+            WHERE InstanceName = '$instance' AND BestPracticeName = 'MaxDOP';
+"@
+        Invoke-DbaQuery -SqlInstance $CentralServer -Database $MonitoringDb -Query $updateMaxdop
+
+        # Update Cost Threshold
+        $updateCostThreshold = @"
+            UPDATE SQLBestPracticeMonitoring
+            SET CurrentValue = '$costThreshold', Status = '$costThresholdStatus',
+                Notes = 'Checked by dbatools',
+                ResolvedDate = CASE WHEN '$costThresholdStatus' = 'Resolved' THEN GETDATE() ELSE NULL END
+            WHERE InstanceName = '$instance' AND BestPracticeName = 'CostThreshold';
+"@
+        Invoke-DbaQuery -SqlInstance $CentralServer -Database $MonitoringDb -Query $updateCostThreshold
+
+        # --- Per-database checks ---
+        $dbs = Get-DbaDatabase -SqlInstance $instance | Where-Object { $_.Name -notin @('master','model','msdb','tempdb') }
+        foreach ($db in $dbs) {
+            $dbName = $db.Name
+            $autoshrink = $db.AutoShrink
+            $recovery = $db.RecoveryModel
+            $pageVerify = $db.PageVerifyOption
+            $compatLevel = $db.CompatibilityLevel
+            $trustworthy = $db.IsTrustworthy
+            $lastFullBackup = $db.LastFullBackup
+
+            # Update AutoShrink
+            $updateAutoShrink = @"
+                UPDATE SQLBestPracticeMonitoring
+                SET CurrentValue = '$($autoshrink ? "Yes" : "No")', Status = CASE WHEN '$autoshrink' = 'False' THEN 'Resolved' ELSE 'Unresolved' END,
+                    Notes = 'Checked by dbatools', ResolvedDate = CASE WHEN '$autoshrink' = 'False' THEN GETDATE() ELSE NULL END
+                WHERE InstanceName = '$instance' AND DatabaseName = '$dbName' AND BestPracticeName = 'AutoShrink';
+"@
+            Invoke-DbaQuery -SqlInstance $CentralServer -Database $MonitoringDb -Query $updateAutoShrink
+
+            # Update Recovery Model
+            $updateRecovery = @"
+                UPDATE SQLBestPracticeMonitoring
+                SET CurrentValue = '$recovery', Status = CASE WHEN '$recovery' = 'FULL' THEN 'Resolved' ELSE 'Unresolved' END,
+                    Notes = 'Checked by dbatools', ResolvedDate = CASE WHEN '$recovery' = 'FULL' THEN GETDATE() ELSE NULL END
+                WHERE InstanceName = '$instance' AND DatabaseName = '$dbName' AND BestPracticeName = 'RecoveryModel';
+"@
+            Invoke-DbaQuery -SqlInstance $CentralServer -Database $MonitoringDb -Query $updateRecovery
+
+            # Update Page Verify
+            $updatePageVerify = @"
+                UPDATE SQLBestPracticeMonitoring
+                SET CurrentValue = '$pageVerify', Status = CASE WHEN '$pageVerify' = 'CHECKSUM' THEN 'Resolved' ELSE 'Unresolved' END,
+                    Notes = 'Checked by dbatools', ResolvedDate = CASE WHEN '$pageVerify' = 'CHECKSUM' THEN GETDATE() ELSE NULL END
+                WHERE InstanceName = '$instance' AND DatabaseName = '$dbName' AND BestPracticeName = 'PageVerify';
+"@
+            Invoke-DbaQuery -SqlInstance $CentralServer -Database $MonitoringDb -Query $updatePageVerify
+
+            # Update Compatibility Level
+            # NOTE: Get-DbaDatabase does not expose the server's product version.
+            # You would need to add logic to get SERVERPROPERTY('ProductMajorVersion')
+            # from the remote instance to make this check dynamic.
+            
+            # Update Trustworthy
+            $updateTrustworthy = @"
+                UPDATE SQLBestPracticeMonitoring
+                SET CurrentValue = '$($trustworthy ? "Yes" : "No")', Status = CASE WHEN '$trustworthy' = 'False' THEN 'Resolved' ELSE 'Unresolved' END,
+                    Notes = 'Checked by dbatools', ResolvedDate = CASE WHEN '$trustworthy' = 'False' THEN GETDATE() ELSE NULL END
+                WHERE InstanceName = '$instance' AND DatabaseName = '$dbName' AND BestPracticeName = 'Trustworthy';
+"@
+            Invoke-DbaQuery -SqlInstance $CentralServer -Database $MonitoringDb -Query $updateTrustworthy
+            
+            # Update Last Full Backup (checking if a backup was done in the last 24 hours)
+            $lastFullBackupStatus = if ($lastFullBackup -and ( (Get-Date) - $lastFullBackup).TotalHours -le 24) { "Resolved" } else { "Unresolved" }
+            $updateLastFullBackup = @"
+                UPDATE SQLBestPracticeMonitoring
+                SET CurrentValue = '$lastFullBackup', Status = '$lastFullBackupStatus',
+                    Notes = 'Checked by dbatools', ResolvedDate = CASE WHEN '$lastFullBackupStatus' = 'Resolved' THEN GETDATE() ELSE NULL END
+                WHERE InstanceName = '$instance' AND DatabaseName = '$dbName' AND BestPracticeName = 'LastFullBackup';
+"@
+            Invoke-DbaQuery -SqlInstance $CentralServer -Database $MonitoringDb -Query $updateLastFullBackup
+        }
+
+        # --- Tempdb file count best practice ---
+        $tempdbFiles = Get-DbaDatabaseFile -SqlInstance $instance -Database tempdb | Where-Object { $_.Type -eq 'Data' }
+        $fileCount = $tempdbFiles.Count
+        
+        $updateTempdb = @"
+            UPDATE SQLBestPracticeMonitoring
+            SET CurrentValue = '$fileCount', Status = CASE WHEN $fileCount -ge 4 THEN 'Resolved' ELSE 'Unresolved' END,
+                Notes = 'Checked by dbatools', ResolvedDate = CASE WHEN $fileCount -ge 4 THEN GETDATE() ELSE NULL END
+            WHERE InstanceName = '$instance' AND DatabaseName = 'tempdb' AND BestPracticeName = 'TempdbFileCount';
+"@
+        Invoke-DbaQuery -SqlInstance $CentralServer -Database $MonitoringDb -Query $updateTempdb
+
+    } catch {
+        $errorMsg = $_.Exception.Message.Replace("'", "''")
+        $logQuery = @"
+            INSERT INTO SQLBestPracticeMonitoringErrors (InstanceID, DatabaseName, BestPracticeName, ErrorMessage, LogTime)
+            VALUES (
+                (SELECT InstanceID FROM Instances WHERE InstanceName = '$instance'),
+                '$instance',
+                'BestPracticeCheck',
+                '$errorMsg',
+                GETDATE()
+            );
+"@
+        Invoke-DbaQuery -SqlInstance $CentralServer -Database $MonitoringDb -Query $logQuery
+        Write-Host "Error processing instance $instance. Error logged to central server." -ForegroundColor Red
+    }
+}
+
+Write-Host "SQL Best Practices Check completed for all instances." -ForegroundColor Yellow
