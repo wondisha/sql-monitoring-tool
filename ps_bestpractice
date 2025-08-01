@@ -1,91 +1,499 @@
-# Requires: dbatools, access to your central monitoring SQL Server
+USE [InstanceMonitor_poc]
+GO
+/****** Object:  StoredProcedure [dbo].[usp_CheckSQLBestPractices]    Script Date: 8/1/2025 3:54:19 PM ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
 
-# Central SQL Server and instance inventory table
-$centralServer = "YourCentralSqlServer"
-$instanceQuery = "SELECT Instance FROM abc.dbo.instance"
-$instances = Invoke-DbaQuery -SqlInstance $centralServer -Query $instanceQuery | Select-Object -ExpandProperty Instance
+ALTER PROCEDURE [dbo].[usp_CheckSQLBestPractices]
+AS
+BEGIN
+    SET NOCOUNT ON;
 
-foreach ($instance in $instances) {
-    try {
-        # Get global settings
-        $maxdop = (Get-DbaSpConfigure -SqlInstance $instance -Name 'max degree of parallelism').ConfigValue
-        $costThreshold = (Get-DbaSpConfigure -SqlInstance $instance -Name 'cost threshold for parallelism').ConfigValue
+    -------------------------------------------------------------------
+    -- Cleanup Phase: Remove stale/irrelevant records before new checks
+    -------------------------------------------------------------------
 
-        # Update global checks
-        $updateMaxdop = @"
+    -- Remove monitoring records for servers/databases no longer in inventory
+    DELETE FROM SQLBestPracticeMonitoring
+    WHERE InstanceID NOT IN (SELECT InstanceID FROM Instances)
+        OR DBID NOT IN (SELECT DBID FROM DBInfo);
+
+    -- Optionally, remove resolved records older than 90 days
+    DELETE FROM SQLBestPracticeMonitoring
+    WHERE Status = 'Resolved' AND ResolvedDate < DATEADD(day,-90,GETDATE());
+
+    -------------------------------------------------------------------
+    -- Debug log table
+    -------------------------------------------------------------------
+    DECLARE @DebugLog TABLE (LogMessage NVARCHAR(MAX), LogTime DATETIME);
+
+    -- Instance-level variables
+    DECLARE @InstanceID INT, @InstanceName NVARCHAR(100);
+    DECLARE @BestPracticeID INT;
+    DECLARE @RecommendedMaxDOP INT, @LogicalProcessorsPerNUMA INT, @NUMANodeCount INT, @TotalLogicalProcessors INT, @CurrentMaxDOP INT;
+    DECLARE @CurrentCostThreshold INT, @RecommendedCostThreshold INT = 25;
+    DECLARE @MaxServerMemory BIGINT, @MinServerMemory BIGINT, @TotalPhysicalMemory BIGINT;
+    DECLARE @TempdbFileCount INT, @TempdbRecommendedFiles INT;
+    DECLARE @LatestCompatLevel INT;
+    DECLARE @DBID INT, @DBName NVARCHAR(128);
+
+    -- Log start of execution
+    INSERT INTO @DebugLog (LogMessage, LogTime) VALUES ('Starting SQL Best Practices Check', GETDATE());
+
+    -- Instance Cursor
+    DECLARE instance_cursor CURSOR LOCAL FAST_FORWARD FOR
+    SELECT InstanceID, Instance FROM Instances;
+
+    OPEN instance_cursor;
+    FETCH NEXT FROM instance_cursor INTO @InstanceID, @InstanceName;
+
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        -- Gather instance-level info
+        BEGIN TRY
+            -- Calculate recommended MaxDOP
+            SELECT @NUMANodeCount = COUNT(DISTINCT node_id)
+            FROM sys.dm_os_nodes
+            WHERE node_state_desc = 'ONLINE' AND node_id < 64;
+
+            SELECT @TotalLogicalProcessors = cpu_count
+            FROM sys.dm_os_sys_info;
+
+            SET @LogicalProcessorsPerNUMA = CASE WHEN @NUMANodeCount > 0 THEN @TotalLogicalProcessors / @NUMANodeCount ELSE @TotalLogicalProcessors END;
+            SET @RecommendedMaxDOP = CASE WHEN @LogicalProcessorsPerNUMA <= 8 THEN @LogicalProcessorsPerNUMA ELSE 8 END;
+
+            SELECT @CurrentMaxDOP = CAST(value_in_use AS INT)
+            FROM sys.configurations
+            WHERE Name = 'max degree of parallelism';
+
+            SELECT @CurrentCostThreshold = CAST(value_in_use AS INT)
+            FROM sys.configurations
+            WHERE name = 'cost threshold for parallelism';
+
+            SELECT @MaxServerMemory = CAST(value_in_use AS BIGINT)
+            FROM sys.configurations
+            WHERE name = 'max server memory (MB)';
+
+            SELECT @MinServerMemory = CAST(value_in_use AS BIGINT)
+            FROM sys.configurations
+            WHERE name = 'min server memory (MB)';
+
+            SELECT @TotalPhysicalMemory = total_physical_memory_kb / 1024
+            FROM sys.dm_os_sys_memory;
+
+            SELECT @TempdbFileCount = COUNT(*)
+            FROM sys.master_files
+            WHERE database_id = DB_ID('tempdb') AND type = 0;
+
+            SET @TempdbRecommendedFiles = CASE WHEN @TotalLogicalProcessors <= 8 THEN @TotalLogicalProcessors ELSE 8 END;
+
+            SELECT @LatestCompatLevel =
+                CASE
+                    WHEN SERVERPROPERTY('ProductMajorVersion') = 16 THEN 160
+                    WHEN SERVERPROPERTY('ProductMajorVersion') = 15 THEN 150
+                    WHEN SERVERPROPERTY('ProductMajorVersion') = 14 THEN 140
+                    WHEN SERVERPROPERTY('ProductMajorVersion') = 13 THEN 130
+                    ELSE 120
+                END;
+
+            -- Instance-Level Checks
+
+            -- MaxDOP
+            SET @BestPracticeID = NULL
+            SELECT @BestPracticeID = bestpracticeid FROM dbo.SQLBestPracticeMonitoring WHERE BestPracticeName = 'MaxDOP';
+
             UPDATE SQLBestPracticeMonitoring
-            SET CurrentValue = '$maxdop', Status = CASE WHEN '$maxdop' = '8' THEN 'Resolved' ELSE 'Unresolved' END,
-                Notes = 'Checked by dbatools', ResolvedDate = CASE WHEN '$maxdop' = '8' THEN GETDATE() ELSE NULL END
-            WHERE InstanceName = '$instance' AND BestPracticeName = 'MaxDOP'
-        "@
-        Invoke-DbaQuery -SqlInstance $centralServer -Query $updateMaxdop
+            SET Status = 'Resolved', 
+                CurrentValue = CAST(@CurrentMaxDOP AS NVARCHAR(255)), 
+                Notes = 'MaxDOP is set as recommended.', 
+                ResolvedDate = GETDATE()
+            WHERE InstanceID = @InstanceID
+              AND DBID = 0
+              AND BestPracticeName = 'MaxDOP'
+              AND Status = 'Unresolved'
+              AND CAST(@CurrentMaxDOP AS NVARCHAR(255)) = CAST(@RecommendedMaxDOP AS NVARCHAR(255));
 
-        $updateCostThreshold = @"
+            INSERT INTO SQLBestPracticeMonitoring (BestPracticeID,InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+            SELECT @BestPracticeID,@InstanceID, 0, @InstanceName, 'InstanceLevel', 'MaxDOP', 
+                   CAST(@CurrentMaxDOP AS NVARCHAR(255)), 
+                   CAST(@RecommendedMaxDOP AS NVARCHAR(255)), 
+                   'Unresolved',
+                   'MaxDOP should be set to ' + CAST(@RecommendedMaxDOP AS NVARCHAR(10)) + ' based on server configuration.'
+            WHERE CAST(@CurrentMaxDOP AS NVARCHAR(255)) <> CAST(@RecommendedMaxDOP AS NVARCHAR(255))
+              AND NOT EXISTS (
+                SELECT 1 FROM SQLBestPracticeMonitoring
+                WHERE InstanceID = @InstanceID AND DBID = 0 AND BestPracticeName = 'MaxDOP' AND Status = 'Unresolved'
+            );
+
+            -- Cost Threshold for Parallelism
+            SET @BestPracticeID = NULL
+            SELECT @BestPracticeID = bestpracticeid FROM dbo.SQLBestPracticeMonitoring WHERE BestPracticeName = 'CostThresholdParallelism';
+
             UPDATE SQLBestPracticeMonitoring
-            SET CurrentValue = '$costThreshold', Status = CASE WHEN '$costThreshold' = '50' THEN 'Resolved' ELSE 'Unresolved' END,
-                Notes = 'Checked by dbatools', ResolvedDate = CASE WHEN '$costThreshold' = '50' THEN GETDATE() ELSE NULL END
-            WHERE InstanceName = '$instance' AND BestPracticeName = 'CostThreshold'
-        "@
-        Invoke-DbaQuery -SqlInstance $centralServer -Query $updateCostThreshold
+            SET Status = 'Resolved', 
+                CurrentValue = CAST(@CurrentCostThreshold AS NVARCHAR(255)), 
+                Notes = 'Cost threshold for parallelism is appropriately configured.', 
+                ResolvedDate = GETDATE()
+            WHERE InstanceID = @InstanceID
+              AND DBID = 0
+              AND BestPracticeName = 'CostThresholdParallelism'
+              AND Status = 'Unresolved'
+              AND CAST(@CurrentCostThreshold AS NVARCHAR(255)) >= CAST(@RecommendedCostThreshold AS NVARCHAR(255));
 
-        # Per-database checks
-        $dbs = Get-DbaDatabase -SqlInstance $instance | Where-Object { $_.Name -notin @('master','model','msdb','tempdb') }
-        foreach ($db in $dbs) {
-            $dbName = $db.Name
-            $autoshrink = $db.AutoShrink
-            $recovery = $db.RecoveryModel
-            $pageVerify = $db.PageVerifyOption
+            INSERT INTO SQLBestPracticeMonitoring (BestPracticeID,InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+            SELECT @BestPracticeID,@InstanceID, 0, @InstanceName, 'InstanceLevel', 'CostThresholdParallelism', 
+                   CAST(@CurrentCostThreshold AS NVARCHAR(255)), 
+                   CAST(@RecommendedCostThreshold AS NVARCHAR(255)), 
+                   'Unresolved',
+                   'Cost threshold for parallelism should be at least ' + CAST(@RecommendedCostThreshold AS NVARCHAR(10)) + ' for better performance.'
+            WHERE CAST(@CurrentCostThreshold AS NVARCHAR(255)) < CAST(@RecommendedCostThreshold AS NVARCHAR(255))
+              AND NOT EXISTS (
+                SELECT 1 FROM SQLBestPracticeMonitoring
+                WHERE InstanceID = @InstanceID AND DBID = 0 AND BestPracticeName = 'CostThresholdParallelism' AND Status = 'Unresolved'
+            );
 
-            # Update AutoShrink
-            $updateAutoShrink = @"
-                UPDATE SQLBestPracticeMonitoring
-                SET CurrentValue = '$($autoshrink ? "Yes" : "No")', Status = CASE WHEN '$autoshrink' = 'False' THEN 'Resolved' ELSE 'Unresolved' END,
-                    Notes = 'Checked by dbatools', ResolvedDate = CASE WHEN '$autoshrink' = 'False' THEN GETDATE() ELSE NULL END
-                WHERE InstanceName = '$instance' AND DatabaseName = '$dbName' AND BestPracticeName = 'AutoShrink'
-            "@
-            Invoke-DbaQuery -SqlInstance $centralServer -Query $updateAutoShrink
+            -- Max Server Memory
+            SET @BestPracticeID = NULL
+            SELECT @BestPracticeID = bestpracticeid FROM dbo.SQLBestPracticeMonitoring WHERE BestPracticeName = 'MaxServerMemory';
 
-            # Update Recovery Model
-            $updateRecovery = @"
-                UPDATE SQLBestPracticeMonitoring
-                SET CurrentValue = '$recovery', Status = CASE WHEN '$recovery' = 'FULL' THEN 'Resolved' ELSE 'Unresolved' END,
-                    Notes = 'Checked by dbatools', ResolvedDate = CASE WHEN '$recovery' = 'FULL' THEN GETDATE() ELSE NULL END
-                WHERE InstanceName = '$instance' AND DatabaseName = '$dbName' AND BestPracticeName = 'RecoveryModel'
-            "@
-            Invoke-DbaQuery -SqlInstance $centralServer -Query $updateRecovery
-
-            # Update Page Verify
-            $updatePageVerify = @"
-                UPDATE SQLBestPracticeMonitoring
-                SET CurrentValue = '$pageVerify', Status = CASE WHEN '$pageVerify' = 'CHECKSUM' THEN 'Resolved' ELSE 'Unresolved' END,
-                    Notes = 'Checked by dbatools', ResolvedDate = CASE WHEN '$pageVerify' = 'CHECKSUM' THEN GETDATE() ELSE NULL END
-                WHERE InstanceName = '$instance' AND DatabaseName = '$dbName' AND BestPracticeName = 'PageVerify'
-            "@
-            Invoke-DbaQuery -SqlInstance $centralServer -Query $updatePageVerify
-
-            # Add more checks as needed...
-        }
-
-        # Tempdb file count best practice
-        $tempdbFiles = Get-DbaDatabaseFile -SqlInstance $instance -Database tempdb | Where-Object { $_.Type -eq 'Data' }
-        $fileCount = $tempdbFiles.Count
-
-        $updateTempdb = @"
             UPDATE SQLBestPracticeMonitoring
-            SET CurrentValue = '$fileCount', Status = CASE WHEN $fileCount -ge 4 THEN 'Resolved' ELSE 'Unresolved' END,
-                Notes = 'Checked by dbatools', ResolvedDate = CASE WHEN $fileCount -ge 4 THEN GETDATE() ELSE NULL END
-            WHERE InstanceName = '$instance' AND DatabaseName = 'tempdb' AND BestPracticeName = 'TempdbFiles'
-        "@
-        Invoke-DbaQuery -SqlInstance $centralServer -Query $updateTempdb
+            SET Status = 'Resolved', 
+                CurrentValue = CAST(@MaxServerMemory AS NVARCHAR(255)) + ' MB', 
+                Notes = 'Max server memory is properly configured.', 
+                ResolvedDate = GETDATE()
+            WHERE InstanceID = @InstanceID
+              AND DBID = 0
+              AND BestPracticeName = 'MaxServerMemory'
+              AND Status = 'Unresolved'
+              AND @MaxServerMemory != 2147483647
+              AND @MaxServerMemory < (@TotalPhysicalMemory * 0.9);
 
-    } catch {
-        $errorMsg = $_.Exception.Message.Replace("'", "''")
-        $logQuery = @"
-            INSERT INTO SQLBestPracticeMonitoringErrors (InstanceID, DBID, DatabaseName, BestPracticeName, ErrorMessage, ErrorLine, LogTime)
-            VALUES (
-                NULL, NULL, '$instance', 'BestPracticeCheck', '$errorMsg', NULL, GETDATE()
+            INSERT INTO SQLBestPracticeMonitoring (BestPracticeID,InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+            SELECT @BestPracticeID,@InstanceID, 0, @InstanceName, 'InstanceLevel', 'MaxServerMemory',
+                   CASE WHEN @MaxServerMemory = 2147483647 THEN 'Unlimited (Default)' ELSE CAST(@MaxServerMemory AS NVARCHAR(255)) + ' MB' END,
+                   CAST(CAST(@TotalPhysicalMemory * 0.8 AS INT) AS NVARCHAR(255)) + ' MB', 
+                   'Unresolved',
+                   'Max server memory should be configured to leave memory for OS. Recommended: ' + CAST(CAST(@TotalPhysicalMemory * 0.8 AS INT) AS NVARCHAR(10)) + ' MB'
+            WHERE 
+                (@MaxServerMemory = 2147483647 OR @MaxServerMemory >= (@TotalPhysicalMemory * 0.9))
+              AND NOT EXISTS (
+                SELECT 1 FROM SQLBestPracticeMonitoring
+                WHERE InstanceID = @InstanceID AND DBID = 0 AND BestPracticeName = 'MaxServerMemory' AND Status = 'Unresolved'
+            );
+
+            -- Tempdb Configuration
+            SET @BestPracticeID = NULL
+            SELECT @BestPracticeID = bestpracticeid FROM dbo.SQLBestPracticeMonitoring WHERE BestPracticeName = 'TempdbFileCount';
+
+            UPDATE SQLBestPracticeMonitoring
+            SET Status = 'Resolved', 
+                CurrentValue = CAST(@TempdbFileCount AS NVARCHAR(255)) + ' files', 
+                Notes = 'Tempdb has optimal number of data files.', 
+                ResolvedDate = GETDATE()
+            WHERE InstanceID = @InstanceID
+              AND DBID = 0
+              AND BestPracticeName = 'TempdbFileCount'
+              AND Status = 'Unresolved'
+              AND @TempdbFileCount = @TempdbRecommendedFiles;
+
+            INSERT INTO SQLBestPracticeMonitoring (BestPracticeID,InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+            SELECT @BestPracticeID,@InstanceID, 0, @InstanceName, 'InstanceLevel', 'TempdbFileCount', 
+                   CAST(@TempdbFileCount AS NVARCHAR(255)) + ' files', 
+                   CAST(@TempdbRecommendedFiles AS NVARCHAR(255)) + ' files', 
+                   'Unresolved',
+                   'Tempdb should have ' + CAST(@TempdbRecommendedFiles AS NVARCHAR(10)) + ' data files (equal to CPU cores, max 8) for optimal performance.'
+            WHERE @TempdbFileCount != @TempdbRecommendedFiles
+              AND NOT EXISTS (
+                    SELECT 1 FROM SQLBestPracticeMonitoring
+                    WHERE InstanceID = @InstanceID AND DBID = 0 AND BestPracticeName = 'TempdbFileCount' AND Status = 'Unresolved'
+              );
+
+        END TRY
+        BEGIN CATCH
+            INSERT INTO SQLBestPracticeMonitoringErrors (
+                InstanceID, DBID, DatabaseName, BestPracticeName,
+                ErrorMessage, ErrorLine, LogTime
             )
-        "@
-        Invoke-DbaQuery -SqlInstance $centralServer -Query $logQuery
-    }
-}
+            VALUES (
+                ISNULL(@InstanceID, -1),
+                0,
+                ISNULL(@InstanceName, 'Unknown'),
+                'InstanceLevel',
+                ERROR_MESSAGE(),
+                ERROR_LINE(),
+                GETDATE()
+            );
+
+            INSERT INTO @DebugLog (LogMessage, LogTime)
+            VALUES ('Instance-level Error: ' + ERROR_MESSAGE(), GETDATE());
+        END CATCH
+
+        -- Database-level checks for this instance
+        DECLARE db_cursor CURSOR LOCAL FAST_FORWARD FOR
+        SELECT DBID, Name
+        FROM DBInfo
+        WHERE InstanceID = @InstanceID
+          AND Name NOT IN ('master', 'model', 'msdb', 'tempdb');
+
+        OPEN db_cursor;
+        FETCH NEXT FROM db_cursor INTO @DBID, @DBName;
+
+        WHILE @@FETCH_STATUS = 0
+        BEGIN
+            BEGIN TRY
+                -- Page Verify Check
+                SET @BestPracticeID = NULL
+                SELECT @BestPracticeID = bestpracticeid FROM dbo.SQLBestPracticeMonitoring WHERE BestPracticeName = 'PageVerify';
+
+                UPDATE SQLBestPracticeMonitoring
+                SET Status = 'Resolved', 
+                    CurrentValue = 'CHECKSUM', 
+                    Notes = 'Page Verify is set to CHECKSUM.', 
+                    ResolvedDate = GETDATE()
+                FROM SQLBestPracticeMonitoring bpm
+                JOIN sys.databases d ON bpm.DBID = d.database_id
+                WHERE bpm.InstanceID = @InstanceID
+                  AND bpm.DBID = @DBID
+                  AND bpm.BestPracticeName = 'PageVerify'
+                  AND d.page_verify_option_desc = 'CHECKSUM'
+                  AND bpm.Status = 'Unresolved';
+
+                INSERT INTO SQLBestPracticeMonitoring (BestPracticeID,InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+                SELECT @BestPracticeID,@InstanceID, @DBID, @InstanceName, @DBName, 'PageVerify', 
+                        d.page_verify_option_desc, 
+                        'CHECKSUM', 'Unresolved', 'Page Verify should be set to CHECKSUM for data integrity.'
+                FROM sys.databases d
+                WHERE d.database_id = @DBID AND d.page_verify_option_desc != 'CHECKSUM'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM SQLBestPracticeMonitoring
+                      WHERE InstanceID = @InstanceID AND DBID = @DBID AND BestPracticeName = 'PageVerify' AND Status = 'Unresolved'
+                  );
+
+                -- Recovery Model Check
+                SET @BestPracticeID = NULL
+                SELECT @BestPracticeID = bestpracticeid FROM dbo.SQLBestPracticeMonitoring WHERE BestPracticeName = 'RecoveryModel';
+
+                UPDATE SQLBestPracticeMonitoring
+                SET Status = 'Resolved',
+                    CurrentValue = 'FULL',
+                    Notes = 'Recovery Model is FULL.',
+                    ResolvedDate = GETDATE()
+                FROM SQLBestPracticeMonitoring bpm
+                JOIN sys.databases d ON bpm.DBID = d.database_id
+                WHERE bpm.InstanceID = @InstanceID
+                  AND bpm.DBID = @DBID
+                  AND bpm.BestPracticeName = 'RecoveryModel'
+                  AND d.recovery_model_desc = 'FULL'
+                  AND bpm.Status = 'Unresolved';
+
+                INSERT INTO SQLBestPracticeMonitoring (BestPracticeID,InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+                SELECT @BestPracticeID,@InstanceID, @DBID, @InstanceName, @DBName, 'RecoveryModel', 
+                        d.recovery_model_desc, 
+                        'FULL', 'Unresolved', 'Recovery Model should be FULL for production databases.'
+                FROM sys.databases d
+                WHERE d.database_id = @DBID AND d.recovery_model_desc != 'FULL'
+                  AND d.name NOT IN ('master', 'model', 'msdb', 'tempdb')
+                  AND NOT EXISTS (
+                      SELECT 1 FROM SQLBestPracticeMonitoring
+                      WHERE InstanceID = @InstanceID AND DBID = @DBID AND BestPracticeName = 'RecoveryModel' AND Status = 'Unresolved'
+                  );
+
+                -- NEW: Auto-Shrink Check
+                SET @BestPracticeID = NULL
+                SELECT @BestPracticeID = bestpracticeid FROM dbo.SQLBestPracticeMonitoring WHERE BestPracticeName = 'AutoShrink';
+
+                UPDATE SQLBestPracticeMonitoring
+                SET Status = 'Resolved',
+                    CurrentValue = 'OFF',
+                    Notes = 'Auto Shrink is correctly disabled.',
+                    ResolvedDate = GETDATE()
+                FROM SQLBestPracticeMonitoring bpm
+                JOIN sys.databases d ON bpm.DBID = d.database_id
+                WHERE bpm.InstanceID = @InstanceID
+                  AND bpm.DBID = @DBID
+                  AND bpm.BestPracticeName = 'AutoShrink'
+                  AND d.is_auto_shrink_on = 0
+                  AND bpm.Status = 'Unresolved';
+
+                INSERT INTO SQLBestPracticeMonitoring (BestPracticeID,InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+                SELECT @BestPracticeID, @InstanceID, @DBID, @InstanceName, @DBName, 'AutoShrink',
+                       'ON', 'OFF', 'Unresolved', 'The Auto Shrink option should be OFF to prevent performance degradation and fragmentation.'
+                FROM sys.databases d
+                WHERE d.database_id = @DBID
+                  AND d.is_auto_shrink_on = 1
+                  AND d.name NOT IN ('master', 'model', 'msdb', 'tempdb')
+                  AND NOT EXISTS (
+                      SELECT 1 FROM SQLBestPracticeMonitoring
+                      WHERE InstanceID = @InstanceID AND DBID = @DBID AND BestPracticeName = 'AutoShrink' AND Status = 'Unresolved'
+                  );
+
+
+                -- NEW: Auto-Growth Check (looking for percentage-based growth)
+                SET @BestPracticeID = NULL
+                SELECT @BestPracticeID = bestpracticeid FROM dbo.SQLBestPracticeMonitoring WHERE BestPracticeName = 'AutoGrowth';
+
+                UPDATE SQLBestPracticeMonitoring
+                SET Status = 'Resolved',
+                    CurrentValue = 'MB',
+                    Notes = 'Auto-growth is configured using a fixed MB value.',
+                    ResolvedDate = GETDATE()
+                FROM SQLBestPracticeMonitoring bpm
+                JOIN sys.master_files f ON bpm.DBID = f.database_id
+                WHERE bpm.InstanceID = @InstanceID
+                  AND bpm.DBID = @DBID
+                  AND bpm.BestPracticeName = 'AutoGrowth'
+                  AND f.is_percent_growth = 0
+                  AND bpm.Status = 'Unresolved';
+
+                INSERT INTO SQLBestPracticeMonitoring (BestPracticeID,InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+                SELECT @BestPracticeID, @InstanceID, @DBID, @InstanceName, @DBName, 'AutoGrowth',
+                       'Percentage', 'MB', 'Unresolved', 'Auto-growth should be set to a fixed MB value to prevent unpredictable file size increases.'
+                FROM sys.master_files f
+                WHERE f.database_id = @DBID
+                  AND f.is_percent_growth = 1
+                  AND NOT EXISTS (
+                      SELECT 1 FROM SQLBestPracticeMonitoring
+                      WHERE InstanceID = @InstanceID AND DBID = @DBID AND BestPracticeName = 'AutoGrowth' AND Status = 'Unresolved'
+                  );
+
+                -- NEW: Compatibility Level Check
+                SET @BestPracticeID = NULL
+                SELECT @BestPracticeID = bestpracticeid FROM dbo.SQLBestPracticeMonitoring WHERE BestPracticeName = 'CompatibilityLevel';
+
+                UPDATE SQLBestPracticeMonitoring
+                SET Status = 'Resolved',
+                    CurrentValue = CAST(d.compatibility_level AS NVARCHAR(255)),
+                    Notes = 'Compatibility level is up to date with the server version.',
+                    ResolvedDate = GETDATE()
+                FROM SQLBestPracticeMonitoring bpm
+                JOIN sys.databases d ON bpm.DBID = d.database_id
+                WHERE bpm.InstanceID = @InstanceID
+                  AND bpm.DBID = @DBID
+                  AND bpm.BestPracticeName = 'CompatibilityLevel'
+                  AND d.compatibility_level = @LatestCompatLevel
+                  AND bpm.Status = 'Unresolved';
+
+                INSERT INTO SQLBestPracticeMonitoring (BestPracticeID,InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+                SELECT @BestPracticeID, @InstanceID, @DBID, @InstanceName, @DBName, 'CompatibilityLevel',
+                       CAST(d.compatibility_level AS NVARCHAR(255)), CAST(@LatestCompatLevel AS NVARCHAR(255)),
+                       'Unresolved', 'The database compatibility level is outdated. It should be updated to ' + CAST(@LatestCompatLevel AS NVARCHAR(10)) + '.'
+                FROM sys.databases d
+                WHERE d.database_id = @DBID
+                  AND d.compatibility_level != @LatestCompatLevel
+                  AND d.name NOT IN ('master', 'model', 'msdb', 'tempdb')
+                  AND NOT EXISTS (
+                      SELECT 1 FROM SQLBestPracticeMonitoring
+                      WHERE InstanceID = @InstanceID AND DBID = @DBID AND BestPracticeName = 'CompatibilityLevel' AND Status = 'Unresolved'
+                  );
+
+
+                -- NEW: Trustworthy Check
+                SET @BestPracticeID = NULL
+                SELECT @BestPracticeID = bestpracticeid FROM dbo.SQLBestPracticeMonitoring WHERE BestPracticeName = 'Trustworthy';
+
+                UPDATE SQLBestPracticeMonitoring
+                SET Status = 'Resolved',
+                    CurrentValue = 'OFF',
+                    Notes = 'The TRUSTWORTHY setting is correctly disabled.',
+                    ResolvedDate = GETDATE()
+                FROM SQLBestPracticeMonitoring bpm
+                JOIN sys.databases d ON bpm.DBID = d.database_id
+                WHERE bpm.InstanceID = @InstanceID
+                  AND bpm.DBID = @DBID
+                  AND bpm.BestPracticeName = 'Trustworthy'
+                  AND d.is_trustworthy_on = 0
+                  AND bpm.Status = 'Unresolved';
+
+                INSERT INTO SQLBestPracticeMonitoring (BestPracticeID,InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+                SELECT @BestPracticeID, @InstanceID, @DBID, @InstanceName, @DBName, 'Trustworthy',
+                       'ON', 'OFF', 'Unresolved', 'The database TRUSTWORTHY property should be OFF for security reasons.'
+                FROM sys.databases d
+                WHERE d.database_id = @DBID
+                  AND d.is_trustworthy_on = 1
+                  AND NOT EXISTS (
+                      SELECT 1 FROM SQLBestPracticeMonitoring
+                      WHERE InstanceID = @InstanceID AND DBID = @DBID AND BestPracticeName = 'Trustworthy' AND Status = 'Unresolved'
+                  );
+
+                -- NEW: Last Full Backup Check (Checks for a backup in the last 24 hours)
+                SET @BestPracticeID = NULL
+                SELECT @BestPracticeID = bestpracticeid FROM dbo.SQLBestPracticeMonitoring WHERE BestPracticeName = 'LastFullBackup';
+
+                UPDATE SQLBestPracticeMonitoring
+                SET Status = 'Resolved',
+                    CurrentValue = 'Recent Backup Found',
+                    Notes = 'A full backup was successfully completed in the last 24 hours.',
+                    ResolvedDate = GETDATE()
+                FROM SQLBestPracticeMonitoring bpm
+                JOIN msdb.dbo.backupset bs ON bpm.InstanceID = @InstanceID
+                WHERE bpm.InstanceID = @InstanceID
+                  AND bpm.DBID = @DBID
+                  AND bpm.BestPracticeName = 'LastFullBackup'
+                  AND bs.database_name = @DBName
+                  AND bs.type = 'D'
+                  AND bs.backup_finish_date >= DATEADD(hour, -24, GETDATE())
+                  AND bpm.Status = 'Unresolved';
+
+                INSERT INTO SQLBestPracticeMonitoring (BestPracticeID,InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+                SELECT @BestPracticeID, @InstanceID, @DBID, @InstanceName, @DBName, 'LastFullBackup',
+                       'No recent backup', 'Backup in last 24h', 'Unresolved', 'No full database backup has been found in the last 24 hours.'
+                FROM sys.databases d
+                WHERE d.database_id = @DBID
+                  AND d.name NOT IN ('master', 'model', 'msdb', 'tempdb')
+                  AND d.state_desc = 'ONLINE'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM msdb.dbo.backupset
+                      WHERE database_name = @DBName
+                        AND type = 'D'
+                        AND backup_finish_date >= DATEADD(hour, -24, GETDATE())
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM SQLBestPracticeMonitoring
+                      WHERE InstanceID = @InstanceID AND DBID = @DBID AND BestPracticeName = 'LastFullBackup' AND Status = 'Unresolved'
+                  );
+
+            END TRY
+            BEGIN CATCH
+                INSERT INTO SQLBestPracticeMonitoringErrors (
+                    InstanceID, DBID, DatabaseName, BestPracticeName,
+                    ErrorMessage, ErrorLine, LogTime
+                )
+                VALUES (
+                    ISNULL(@InstanceID, -1),
+                    ISNULL(@DBID, -1),
+                    ISNULL(@DBName, 'Unknown'),
+                    'DatabaseLevel',
+                    ERROR_MESSAGE(),
+                    ERROR_LINE(),
+                    GETDATE()
+                );
+                INSERT INTO @DebugLog (LogMessage, LogTime)
+                VALUES ('Database-level Error in ' + @DBName + ': ' + ERROR_MESSAGE(), GETDATE());
+            END CATCH
+
+            FETCH NEXT FROM db_cursor INTO @DBID, @DBName;
+        END
+
+        CLOSE db_cursor;
+        DEALLOCATE db_cursor;
+
+        FETCH NEXT FROM instance_cursor INTO @InstanceID, @InstanceName;
+    END
+
+    CLOSE instance_cursor;
+    DEALLOCATE instance_cursor;
+
+    -- Output Debug Log
+    SELECT * FROM @DebugLog ORDER BY LogTime ASC;
+
+    -- Output summary of unresolved issues
+    SELECT BestPracticeName, DatabaseName, Status, COUNT(*) AS IssueCount
+    FROM SQLBestPracticeMonitoring
+    WHERE Status = 'Unresolved'
+    GROUP BY BestPracticeName, DatabaseName, Status
+    ORDER BY BestPracticeName, DatabaseName;
+
+    PRINT 'SQL Best Practices Check Completed at ' + CONVERT(NVARCHAR(30), GETDATE(), 120);
+END
