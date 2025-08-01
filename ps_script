@@ -28,6 +28,7 @@
     - This script requires the 'dbatools' PowerShell module.
     - It must be run with an account that has access to both the central
       monitoring server and all target SQL Server instances.
+    - This version of the script is compatible with Windows PowerShell 5.1.
 #>
 param(
     [string]$CentralServer = "YourCentralSqlServer",
@@ -81,8 +82,11 @@ foreach ($instance in $instances) {
         # NOTE: The T-SQL SP calculates recommended values dynamically.
         # This script uses hardcoded values as a simple example. For a more
         # robust check, you would need to calculate these values in PowerShell.
-        $maxdopStatus = if ($maxdop -eq 8) { "Resolved" } else { "Unresolved" }
-        $costThresholdStatus = if ($costThreshold -ge 50) { "Resolved" } else { "Unresolved" }
+        $maxdopStatus = "Unresolved"
+        if ($maxdop -eq 8) { $maxdopStatus = "Resolved" }
+        
+        $costThresholdStatus = "Unresolved"
+        if ($costThreshold -ge 50) { $costThresholdStatus = "Resolved" }
 
         # Update MaxDOP
         $updateMaxdop = @"
@@ -116,10 +120,14 @@ foreach ($instance in $instances) {
             $lastFullBackup = $db.LastFullBackup
 
             # Update AutoShrink
+            $autoShrinkValue = "No"
+            if ($autoshrink) { $autoShrinkValue = "Yes" }
+            $autoShrinkStatus = "Unresolved"
+            if (-not $autoshrink) { $autoShrinkStatus = "Resolved" }
             $updateAutoShrink = @"
                 UPDATE SQLBestPracticeMonitoring
-                SET CurrentValue = '$($autoshrink ? "Yes" : "No")', Status = CASE WHEN '$autoshrink' = 'False' THEN 'Resolved' ELSE 'Unresolved' END,
-                    Notes = 'Checked by dbatools', ResolvedDate = CASE WHEN '$autoshrink' = 'False' THEN GETDATE() ELSE NULL END
+                SET CurrentValue = '$autoShrinkValue', Status = '$autoShrinkStatus',
+                    Notes = 'Checked by dbatools', ResolvedDate = CASE WHEN '$autoShrinkStatus' = 'Resolved' THEN GETDATE() ELSE NULL END
                 WHERE InstanceName = '$instance' AND DatabaseName = '$dbName' AND BestPracticeName = 'AutoShrink';
 "@
             Invoke-DbaQuery -SqlInstance $CentralServer -Database $MonitoringDb -Query $updateAutoShrink
@@ -141,23 +149,23 @@ foreach ($instance in $instances) {
                 WHERE InstanceName = '$instance' AND DatabaseName = '$dbName' AND BestPracticeName = 'PageVerify';
 "@
             Invoke-DbaQuery -SqlInstance $CentralServer -Database $MonitoringDb -Query $updatePageVerify
-
-            # Update Compatibility Level
-            # NOTE: Get-DbaDatabase does not expose the server's product version.
-            # You would need to add logic to get SERVERPROPERTY('ProductMajorVersion')
-            # from the remote instance to make this check dynamic.
             
             # Update Trustworthy
+            $trustworthyValue = "No"
+            if ($trustworthy) { $trustworthyValue = "Yes" }
+            $trustworthyStatus = "Unresolved"
+            if (-not $trustworthy) { $trustworthyStatus = "Resolved" }
             $updateTrustworthy = @"
                 UPDATE SQLBestPracticeMonitoring
-                SET CurrentValue = '$($trustworthy ? "Yes" : "No")', Status = CASE WHEN '$trustworthy' = 'False' THEN 'Resolved' ELSE 'Unresolved' END,
-                    Notes = 'Checked by dbatools', ResolvedDate = CASE WHEN '$trustworthy' = 'False' THEN GETDATE() ELSE NULL END
+                SET CurrentValue = '$trustworthyValue', Status = '$trustworthyStatus',
+                    Notes = 'Checked by dbatools', ResolvedDate = CASE WHEN '$trustworthyStatus' = 'Resolved' THEN GETDATE() ELSE NULL END
                 WHERE InstanceName = '$instance' AND DatabaseName = '$dbName' AND BestPracticeName = 'Trustworthy';
 "@
             Invoke-DbaQuery -SqlInstance $CentralServer -Database $MonitoringDb -Query $updateTrustworthy
             
             # Update Last Full Backup (checking if a backup was done in the last 24 hours)
-            $lastFullBackupStatus = if ($lastFullBackup -and ( (Get-Date) - $lastFullBackup).TotalHours -le 24) { "Resolved" } else { "Unresolved" }
+            $lastFullBackupStatus = "Unresolved"
+            if ($lastFullBackup -and ( (Get-Date) - $lastFullBackup).TotalHours -le 24) { $lastFullBackupStatus = "Resolved" }
             $updateLastFullBackup = @"
                 UPDATE SQLBestPracticeMonitoring
                 SET CurrentValue = '$lastFullBackup', Status = '$lastFullBackupStatus',
