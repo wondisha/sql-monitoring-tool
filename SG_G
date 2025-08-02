@@ -795,3 +795,1090 @@ function Analyze-QueryResourceUtilization {
         }
     } catch {
         Write-Log "[$ServerName] ERROR: Failed to analyze I/O queries. Error: $($_.Exception.Message)" "ERROR"
+        $script:alerts += "[$ServerName] Warning: Failed to analyze I/O queries. Error: $($_.Exception.Message)"
+        Insert-AlertToDB -ServerName $ServerName -AlertLevel "ERROR" -AlertCategory "Performance:QueryAnalysis" -Message "Failed to analyze I/O queries. Error: $($_.Exception.Message)"
+    }
+
+    # 3. Current Waits and Bottlenecks
+    try {
+        Write-Log "[$ServerName] Analyzing current waiting queries..." "INFO"
+        $waitingQueries = Invoke-Sqlcmd -ServerInstance $ServerName -Database "master" -Query $waitQuery -TrustServerCertificate -ErrorAction Stop -MaxCharLength 2147483647
+        if ($waitingQueries -and $waitingQueries.Count -gt 0) {
+            Write-Log "[$ServerName] Top 20 Current Waiting Queries (WaitTimeMS > 100ms):" "INFO"
+            foreach ($wq in $waitingQueries) {
+                $queryPreview = ($wq.query_text.Substring(0, [Math]::Min(100, $wq.query_text.Length))).Replace("`r`n", " ").Replace("`n", " ")
+                $alertMessage = "Waiting Query (Session: $($wq.session_id), DB: $($wq.DatabaseName)): Status: $($wq.status), Command: $($wq.command), Wait Type: $($wq.wait_type), Wait Time: $($wq.WaitTimeMs)ms. Blocking Session: $($wq.blocking_session_id). Query: $queryPreview.... Suggestion: Identify and resolve the root cause of the wait (e.g., blocking, I/O bottleneck, memory pressure)."
+
+                # Insert into QueryPerformanceMetrics table (as waiting query)
+                $insertQuery = "INSERT INTO [dbo].[QueryPerformanceMetrics] (ServerName, DatabaseName, QueryText, WaitType, WaitTimeMs, TotalElapsedTimeMs, QueryCategory, ExecutionPlanXML) VALUES (@ServerName, @DatabaseName, @QueryText, @WaitType, @WaitTimeMs, @TotalElapsedTimeMs, @QueryCategory, @ExecutionPlanXML);"
+                Invoke-Sqlcmd -ServerInstance $Config.MonitoringDBServer -Database $Config.MonitoringDBName `
+                    -Query $insertQuery -TrustServerCertificate -ErrorAction SilentlyContinue `
+                    -Variable @(
+                        "ServerName=$ServerName",
+                        "DatabaseName=$($wq.DatabaseName)",
+                        "QueryText=$($wq.query_text)",
+                        "WaitType=$($wq.wait_type)",
+                        "WaitTimeMs=$($wq.WaitTimeMs)",
+                        "TotalElapsedTimeMs=$($wq.WaitTimeMs)", # Using WaitTimeMs as elapsed for simplicity
+                        "QueryCategory='Waiting'",
+                        "ExecutionPlanXML=$($wq.QueryPlanXML)"
+                    ) | Out-Null
+
+                if ($wq.WaitTimeMs -gt 100) { # Threshold for alert
+                    $script:alerts += "[$ServerName] Performance Alert: " + $alertMessage
+                    Write-Log "[$ServerName] Performance Alert: " + $alertMessage "ALERT"
+                    Insert-AlertToDB -ServerName $ServerName -AlertLevel "ALERT" -AlertCategory "Performance:WaitingQuery" -Message $alertMessage
+                } else {
+                    Write-Log "[$ServerName] INFO: Session: $($wq.session_id), Wait: $($wq.wait_type) $($wq.WaitTimeMs)ms, Query: $queryPreview..." "INFO"
+                }
+            }
+        } else {
+            Write-Log "[$ServerName] INFO: No significant waiting queries currently." "INFO"
+        }
+    } catch {
+        Write-Log "[$ServerName] ERROR: Failed to analyze waiting queries. Error: $($_.Exception.Message)" "ERROR"
+        $script:alerts += "[$ServerName] Warning: Failed to analyze waiting queries. Error: $($_.Exception.Message)"
+        Insert-AlertToDB -ServerName $ServerName -AlertLevel "ERROR" -AlertCategory "Performance:QueryAnalysis" -Message "Failed to analyze waiting queries. Error: $($_.Exception.Message)"
+    }
+}
+
+# Function to invoke Python script for anomaly detection on failed logins
+function Invoke-PythonScript {
+    param (
+        [string]$ScriptContent, # The Python script content as a string
+        [string]$ServerName     # Server name for context in logging and file naming
+    )
+    $tempFile = "$($Config.LogDir)\LastPythonScript_$ServerName.py"
+    $pythonExecutable = "python" # Assuming 'python' is in PATH. Use full path if not (e.g., "C:\Python39\python.exe")
+
+    try {
+        # Write the Python script content to a temporary file
+        [System.IO.File]::WriteAllText($tempFile, $ScriptContent, [System.Text.Encoding]::UTF8)
+        Write-Log "[$ServerName] DEBUG: Python script saved to $tempFile for execution." "DEBUG"
+
+        # Execute the Python script and capture all output (stdout and stderr)
+        $process = Start-Process -FilePath $pythonExecutable -ArgumentList $tempFile -RedirectStandardOutput ([System.IO.Path]::Combine($Config.LogDir, "python_stdout_$ServerName.txt")) -RedirectStandardError ([System.IO.Path]::Combine($Config.LogDir, "python_stderr_$ServerName.txt")) -NoNewWindow -PassThru -Wait
+        $process.WaitForExit()
+
+        $stdout = Get-Content ([System.IO.Path]::Combine($Config.LogDir, "python_stdout_$ServerName.txt")) -Raw
+        $stderr = Get-Content ([System.IO.Path]::Combine($Config.LogDir, "python_stderr_$ServerName.txt")) -Raw
+
+        Remove-Item ([System.IO.Path]::Combine($Config.LogDir, "python_stdout_$ServerName.txt")) -ErrorAction SilentlyContinue
+        Remove-Item ([System.IO.Path]::Combine($Config.LogDir, "python_stderr_$ServerName.txt")) -ErrorAction SilentlyContinue
+
+        if ($process.ExitCode -ne 0) {
+            throw "Python script failed with exit code $($process.ExitCode). STDOUT: `n$stdout`nSTDERR: `n$stderr"
+        }
+        return $stdout
+    } catch {
+        $errorMessage = "[$ServerName] ERROR: Python script execution failed. Error: $($_.Exception.Message)"
+        Write-Log $errorMessage "ERROR"
+        $script:alerts += "[$ServerName] Warning: Python anomaly detection failed. Error: $($_.Exception.Message)"
+        return $null
+    } finally {
+        if (Test-Path $tempFile) {
+            Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
+            Write-Log "[$ServerName] DEBUG: Removed temporary Python script file: $tempFile" "DEBUG"
+        }
+    }
+}
+
+# Function to check database growths and disk space
+function Check-DiskSpaceAndGrowth {
+    param (
+        [string]$ServerName,
+        [int]$MinDiskFreeSpaceGB = 20, # Alert if less than 20GB free
+        [int]$MaxDBFileGrowthMB_PerDay = 1024 # Alert if a DB file grew more than 1GB in last 24 hours
+    )
+
+    $diskSpaceQuery = "EXEC xp_fixeddrives;"
+    $dbFileQuery = @"
+    SELECT
+        DB_NAME(mf.database_id) AS DatabaseName,
+        mf.name AS LogicalFileName,
+        mf.type_desc AS FileType,
+        mf.physical_name AS PhysicalFileName,
+        (mf.size * 8 / 1024) AS CurrentSizeMB,
+        CASE
+            WHEN mf.max_size = -1 THEN 'Unlimited'
+            WHEN mf.max_size > 0 THEN CAST((mf.max_size * 8 / 1024) AS NVARCHAR(50))
+            ELSE 'N/A'
+        END AS MaxSizeMB,
+        CASE mf.is_percent_growth
+            WHEN 1 THEN CAST(mf.growth AS NVARCHAR(50)) + '%'
+            ELSE CAST((mf.growth * 8 / 1024) AS NVARCHAR(50)) + ' MB'
+        END AS GrowthSetting,
+        (SELECT TOP 1 event_data
+         FROM sys.fn_xe_file_target_read_file('system_health*.xel',NULL,NULL,NULL) AS xe
+         WHERE CAST(event_data AS XML).value('(/event/@name)[1]', 'nvarchar(256)') = 'auto_grow'
+           AND CAST(event_data AS XML).value('(/event/data[@name="database_id"]/value)[1]', 'int') = mf.database_id
+         ORDER BY 1 DESC) AS LastGrowthEventXML
+    FROM sys.master_files mf
+    ORDER BY DatabaseName, FileType;
+"@
+
+    # 1. Check Disk Space
+    try {
+        Write-Log "[$ServerName] Checking disk space..." "INFO"
+        $disks = Invoke-Sqlcmd -ServerInstance $ServerName -Database "master" -Query $diskSpaceQuery -TrustServerCertificate -ErrorAction Stop
+        if ($disks -and $disks.Count -gt 0) {
+            foreach ($disk in $disks) {
+                $drive = $disk.drive
+                $mbFree = $disk.MBFree
+                $gbFree = [Math]::Round($mbFree / 1024, 2)
+
+                # Insert into DiskSpaceAndGrowth table (for disk usage)
+                $insertDiskQuery = "INSERT INTO [dbo].[DiskSpaceAndGrowth] (ServerName, DriveLetter, FreeSpaceGB) VALUES (@ServerName, @DriveLetter, @FreeSpaceGB);"
+                Invoke-Sqlcmd -ServerInstance $Config.MonitoringDBServer -Database $Config.MonitoringDBName `
+                    -Query $insertDiskQuery -TrustServerCertificate -ErrorAction SilentlyContinue `
+                    -Variable @(
+                        "ServerName=$ServerName",
+                        "DriveLetter=$drive",
+                        "FreeSpaceGB=$gbFree"
+                    ) | Out-Null
+
+                if ($gbFree -lt $MinDiskFreeSpaceGB) {
+                    $alertMessage = "Drive '$drive' has only $($gbFree) GB free space (below $($MinDiskFreeSpaceGB)GB threshold). Suggestion: Free up disk space or expand the drive."
+                    $script:alerts += "[$ServerName] Critical Alert: " + $alertMessage
+                    Write-Log "[$ServerName] Critical Alert: " + $alertMessage "ALERT"
+                    Insert-AlertToDB -ServerName $ServerName -AlertLevel "CRITICAL" -AlertCategory "Availability:DiskSpace" -Message $alertMessage
+                } else {
+                    Write-Log "[$ServerName] INFO: Drive '$drive' has $($gbFree) GB free space." "INFO"
+                }
+            }
+        } else {
+            Write-Log "[$ServerName] WARN: Could not retrieve disk space info. Check xp_fixeddrives permissions or availability." "WARN"
+            $script:alerts += "[$ServerName] Warning: Could not retrieve disk space info (disk space check skipped)."
+            Insert-AlertToDB -ServerName $ServerName -AlertLevel "WARN" -AlertCategory "Availability:DiskSpace" -Message "Could not retrieve disk space info. Check xp_fixeddrives permissions or availability."
+        }
+    } catch {
+        Write-Log "[$ServerName] ERROR: Failed to check disk space. Error: $($_.Exception.Message)" "ERROR"
+        $script:alerts += "[$ServerName] Warning: Failed to check disk space. Error: $($_.Exception.Message)"
+        Insert-AlertToDB -ServerName $ServerName -AlertLevel "ERROR" -AlertCategory "Availability:DiskSpace" -Message "Failed to check disk space. Error: $($_.Exception.Message)"
+    }
+
+    # 2. Check Database File Growth
+    try {
+        Write-Log "[$ServerName] Checking database file growth settings and recent growth events..." "INFO"
+        $dbFiles = Invoke-Sqlcmd -ServerInstance $ServerName -Database "master" -Query $dbFileQuery -TrustServerCertificate -ErrorAction Stop -MaxCharLength 2147483647
+
+        if ($dbFiles -and $dbFiles.Count -gt 0) {
+            foreach ($file in $dbFiles) {
+                $growthAmountMB = $null # Initialize to null
+                $lastGrowthTime = $null
+
+                # Insert into DiskSpaceAndGrowth table (for database files)
+                # Need to determine GrowthAmountMB and LastGrowthEventTime first for insertion
+                # Parse growth setting
+                $growthMBString = $file.GrowthSetting -replace " MB", ""
+                $parsedGrowthMB = 0
+                if ($file.GrowthSetting -notmatch "\%" -and [int]::TryParse($growthMBString.Trim(), [ref]$parsedGrowthMB)) {
+                    if ($parsedGrowthMB -gt 0 -and $parsedGrowthMB -lt 64) {
+                        $alertMessage = "Database file '$($file.LogicalFileName)' in '$($file.DatabaseName)' has small fixed auto-growth ($($file.GrowthSetting)). Suggestion: Consider increasing auto-growth to at least 64MB or 128MB to reduce frequent growths."
+                        $script:alerts += "[$ServerName] Performance Alert: " + $alertMessage
+                        Write-Log "[$ServerName] Performance Alert: " + $alertMessage "WARN"
+                        Insert-AlertToDB -ServerName $ServerName -AlertLevel "WARN" -AlertCategory "Performance:AutoGrowth" -Message $alertMessage
+                    }
+                }
+
+                # Parse LastGrowthEventXML
+                if ($file.LastGrowthEventXML -ne $null) {
+                    try {
+                        [xml]$eventXml = $file.LastGrowthEventXML
+                        $lastGrowthTime = [datetime]$eventXml.event.timestamp
+                        $growthFileSizeKB = $eventXml.event.data | Where-Object { $_.name -eq 'file_size' } | Select-Object -ExpandProperty value # size in KB
+                        $oldFileSizeKB = $eventXml.event.data | Where-Object { $_.name -eq 'old_file_size' } | Select-Object -ExpandProperty value # size in KB
+                        $growthAmountMB = ([Math]::Round(($growthFileSizeKB - $oldFileSizeKB) / 1024, 2))
+
+                        if (((Get-Date) - $lastGrowthTime).TotalHours -lt 24) {
+                            if ($growthAmountMB -ge $MaxDBFileGrowthMB_PerDay) {
+                                $alertMessage = "Database file '$($file.LogicalFileName)' in '$($file.DatabaseName)' auto-grew by $($growthAmountMB) MB (exceeded $($MaxDBFileGrowthMB_PerDay)MB/day threshold) recently at $($lastGrowthTime). Suggestion: Investigate rapid growth or frequent auto-growth events. Consider adjusting auto-growth size or pre-sizing files."
+                                $script:alerts += "[$ServerName] Performance Alert: " + $alertMessage
+                                Write-Log "[$ServerName] Performance Alert: " + $alertMessage "ALERT"
+                                Insert-AlertToDB -ServerName $ServerName -AlertLevel "ALERT" -AlertCategory "Performance:AutoGrowth" -Message $alertMessage
+                            } else {
+                                Write-Log "[$ServerName] INFO: Database file '$($file.LogicalFileName)' in '$($file.DatabaseName)' auto-grew by $($growthAmountMB) MB recently at $($lastGrowthTime)." "INFO"
+                            }
+                        }
+                    } catch {
+                        Write-Log "[$ServerName] WARN: Error parsing LastGrowthEventXML for $($file.DatabaseName).$($file.LogicalFileName). Error: $($_.Exception.Message)" "WARN"
+                    }
+                }
+
+                # Insert into DiskSpaceAndGrowth table (for file growth details)
+                $insertFileQuery = "INSERT INTO [dbo].[DiskSpaceAndGrowth] (ServerName, DatabaseName, LogicalFileName, PhysicalFileName, CurrentSizeMB, MaxSizeMB, GrowthSetting, LastGrowthEventTime, GrowthAmountMB) VALUES (@ServerName, @DatabaseName, @LogicalFileName, @PhysicalFileName, @CurrentSizeMB, @MaxSizeMB, @GrowthSetting, @LastGrowthEventTime, @GrowthAmountMB);"
+                Invoke-Sqlcmd -ServerInstance $Config.MonitoringDBServer -Database $Config.MonitoringDBName `
+                    -Query $insertFileQuery -TrustServerCertificate -ErrorAction SilentlyContinue `
+                    -Variable @(
+                        "ServerName=$ServerName",
+                        "DatabaseName=$($file.DatabaseName)",
+                        "LogicalFileName=$($file.LogicalFileName)",
+                        "PhysicalFileName=$($file.PhysicalFileName)",
+                        "CurrentSizeMB=$($file.CurrentSizeMB)",
+                        "MaxSizeMB=$($file.MaxSizeMB)",
+                        "GrowthSetting=$($file.GrowthSetting)",
+                        "LastGrowthEventTime=$lastGrowthTime", # Use the parsed datetime object
+                        "GrowthAmountMB=$growthAmountMB"       # Use the parsed growth amount
+                    ) | Out-Null
+
+            } # end foreach ($file in $dbFiles)
+        } else {
+            Write-Log "[$ServerName] INFO: No database file information retrieved for growth analysis. Check permissions." "INFO"
+        }
+    } catch {
+        Write-Log "[$ServerName] ERROR: Failed to check database file growth. Error: $($_.Exception.Message)" "ERROR"
+        $script:alerts += "[$ServerName] Warning: Failed to check database file growth. Error: $($_.Exception.Message)"
+        Insert-AlertToDB -ServerName $ServerName -AlertLevel "ERROR" -AlertCategory "Performance:AutoGrowth" -Message "Failed to check database file growth. Error: $($_.Exception.Message)"
+    }
+}
+
+# Function to monitor SQL Server Agent Jobs
+# Function to monitor SQL Server Agent Jobs
+function Check-AgentJobs {
+    param (
+        [string]$ServerName,
+        [int]$RunDurationThresholdMinutes = 60 # Alert if job runs longer than this
+    )
+    $jobQuery = @"
+    SELECT
+        j.job_id,
+        j.name AS JobName,
+        j.enabled AS IsEnabled,
+        j.description AS JobDescription,
+        jh.run_date,
+        jh.run_time,
+        STUFF(STUFF(RIGHT('000000' + CAST(jh.run_duration AS VARCHAR(6)), 6), 3, 0, ':'), 6, 0, ':') AS RunDurationFormatted,
+        jh.run_duration AS RunDurationSeconds,
+        CASE jh.run_status
+            WHEN 0 THEN 'Failed'
+            WHEN 1 THEN 'Succeeded'
+            WHEN 2 THEN 'Retry'
+            WHEN 3 THEN 'Canceled'
+            WHEN 4 THEN 'Running'
+            ELSE 'Unknown'
+        END AS RunStatus,
+        -- Ensure message is handled to be NULL if truly empty to prevent empty string syntax issues
+        CASE WHEN jh.message IS NULL OR LTRIM(RTRIM(jh.message)) = '' THEN NULL ELSE jh.message END AS LastMessage
+    FROM msdb.dbo.sysjobs j
+    LEFT JOIN msdb.dbo.sysjobhistory jh ON j.job_id = jh.job_id
+    WHERE jh.step_id = 0
+    AND jh.run_date >= CONVERT(INT, CONVERT(VARCHAR, GETDATE() - 1, 112))
+    ORDER BY jh.run_date DESC, jh.run_time DESC;
+"@
+    $runningJobQuery = @"
+    SELECT
+        sj.job_id,
+        sj.name AS JobName,
+        sja.start_execution_date,
+        DATEDIFF(minute, sja.start_execution_date, GETDATE()) AS CurrentRunDurationMinutes
+    FROM msdb.dbo.sysjobs sj
+    INNER JOIN msdb.dbo.sysjobactivity sja ON sj.job_id = sja.job_id
+    WHERE sja.session_id = (SELECT TOP 1 session_id FROM msdb.dbo.syssessions ORDER BY agent_start_date DESC)
+    AND sja.start_execution_date IS NOT NULL AND sja.stop_execution_date IS NULL;
+"@
+
+    try {
+        Write-Log "[$ServerName] Checking SQL Agent Job status and recent history..." "INFO"
+        $jobHistory = Invoke-Sqlcmd -ServerInstance $ServerName -Database "msdb" -Query $jobQuery -TrustServerCertificate -ErrorAction Stop -MaxCharLength 2147483647
+        if ($jobHistory -and $jobHistory.Count -gt 0) {
+            $processedJobs = @{}
+            foreach ($job in $jobHistory) {
+                $duration = $job.RunDurationFormatted.Split(':')
+                $totalSeconds = ($duration[0] * 3600) + ($duration[1] * 60) + $duration[2]
+                $totalMinutes = [Math]::Floor($totalSeconds / 60)
+
+                # Correctly format run_date and run_time for SQL Server DATETIME or DATE/TIME types
+                # run_date is INT (YYYYMMDD), run_time is INT (HHMMSS)
+                # SQL Agent JobStatus table has DATE and TIME columns
+                $lastRunDate = [datetime]::ParseExact($job.run_date, "yyyyMMdd", [System.Globalization.CultureInfo]::InvariantCulture)
+                $lastRunTime = [datetime]::ParseExact($job.run_time.ToString().PadLeft(6, '0'), "HHmmss", [System.Globalization.CultureInfo]::InvariantCulture).ToString("HH:mm:ss")
+
+
+                # Insert into AgentJobStatus table (History)
+                $insertHistoryQuery = "INSERT INTO [dbo].[AgentJobStatus] (ServerName, JobName, IsEnabled, LastRunDate, LastRunTime, LastRunDurationSeconds, LastRunStatus, LastRunMessage) VALUES (@ServerName, @JobName, @IsEnabled, @LastRunDate, @LastRunTime, @LastRunDurationSeconds, @LastRunStatus, @LastRunMessage);"
+                Invoke-Sqlcmd -ServerInstance $Config.MonitoringDBServer -Database $Config.MonitoringDBName `
+                    -Query $insertHistoryQuery -TrustServerCertificate -ErrorAction SilentlyContinue `
+                    -Variable @(
+                        "ServerName=$ServerName",
+                        "JobName=$($job.JobName)",
+                        "IsEnabled=$([int]$job.IsEnabled)",
+                        "LastRunDate=$lastRunDate", # Use parsed datetime object for date
+                        "LastRunTime=$lastRunTime", # Use formatted string for time
+                        "LastRunDurationSeconds=$totalSeconds",
+                        "LastRunStatus=$($job.RunStatus)",
+                        "LastRunMessage=$($job.LastMessage)" # This should now be NULL if empty from SQL query
+                    ) | Out-Null
+
+
+                if ($job.RunStatus -eq 'Failed' -and -not $processedJobs.ContainsKey($job.JobName)) {
+                    $alertMessage = "SQL Agent Job '$($job.JobName)' failed at $($job.run_date) $($job.run_time). Last message: $($job.LastMessage). Suggestion: Review job steps for errors."
+                    $script:alerts += "[$ServerName] Critical Alert: " + $alertMessage
+                    Write-Log "[$ServerName] Critical Alert: " + $alertMessage "ALERT"
+                    Insert-AlertToDB -ServerName $ServerName -AlertLevel "CRITICAL" -AlertCategory "Availability:AgentJob" -Message $alertMessage
+                    $processedJobs[$job.JobName] = $true
+                } elseif ($job.RunStatus -eq 'Succeeded' -and $totalMinutes -gt $RunDurationThresholdMinutes) {
+                    $alertMessage = "SQL Agent Job '$($job.JobName)' succeeded but ran for $($totalMinutes) minutes (exceeded threshold of $($RunDurationThresholdMinutes) min). Suggestion: Investigate job performance history."
+                    $script:alerts += "[$ServerName] Performance Alert: " + $alertMessage
+                    Write-Log "[$ServerName] Performance Alert: " + $alertMessage "WARN"
+                    Insert-AlertToDB -ServerName $ServerName -AlertLevel "WARN" -AlertCategory "Performance:AgentJob" -Message $alertMessage
+                }
+            }
+        } else {
+            Write-Log "[$ServerName] INFO: No recent SQL Agent Job history found for analysis." "INFO"
+        }
+
+        # Check for currently running jobs exceeding threshold
+        $runningJobs = Invoke-Sqlcmd -ServerInstance $ServerName -Database "msdb" -Query $runningJobQuery -TrustServerCertificate -ErrorAction Stop
+        if ($runningJobs -and $runningJobs.Count -gt 0) {
+            foreach ($rJob in $runningJobs) {
+                # This could be a MERGE statement for more robust updates, but for simplicity, we insert (might create duplicates)
+                # Or, even better, update LastRunStatus to 'Running' for relevant job, clear last run info, and populate current run info
+                # For now, let's update if exists, insert if not.
+                $updateOrInsertQuery = @"
+                IF EXISTS (SELECT 1 FROM [dbo].[AgentJobStatus] WHERE ServerName = @ServerName AND JobName = @JobName)
+                BEGIN
+                    UPDATE [dbo].[AgentJobStatus]
+                    SET CurrentRunDurationMinutes = @CurrentRunDurationMinutes,
+                        IsEnabled = 1, -- Assume enabled if running
+                        CaptureTime = SYSDATETIMEOFFSET()
+                    WHERE ServerName = @ServerName AND JobName = @JobName;
+                END
+                ELSE
+                BEGIN
+                    INSERT INTO [dbo].[AgentJobStatus] (ServerName, JobName, IsEnabled, CurrentRunDurationMinutes)
+                    VALUES (@ServerName, @JobName, 1, @CurrentRunDurationMinutes);
+                END
+"@
+                Invoke-Sqlcmd -ServerInstance $Config.MonitoringDBServer -Database $Config.MonitoringDBName `
+                    -Query $updateOrInsertQuery -TrustServerCertificate -ErrorAction SilentlyContinue `
+                    -Variable @(
+                        "ServerName=$ServerName",
+                        "JobName=$($rJob.JobName)",
+                        "CurrentRunDurationMinutes=$($rJob.CurrentRunDurationMinutes)"
+                    ) | Out-Null
+
+                if ($rJob.CurrentRunDurationMinutes -gt $RunDurationThresholdMinutes) {
+                    $alertMessage = "SQL Agent Job '$($rJob.JobName)' is currently running for $($rJob.CurrentRunDurationMinutes) minutes (exceeded threshold of $($RunDurationThresholdMinutes) min). Suggestion: Check job activity and resource consumption."
+                    $script:alerts += "[$ServerName] Performance Alert: " + $alertMessage
+                    Write-Log "[$ServerName] Performance Alert: " + $alertMessage "ALERT"
+                    Insert-AlertToDB -ServerName $ServerName -AlertLevel "ALERT" -AlertCategory "Performance:AgentJobLongRun" -Message $alertMessage
+                }
+            }
+        } else {
+            Write-Log "[$ServerName] INFO: No SQL Agent Jobs currently running beyond threshold." "INFO"
+        }
+    } catch {
+        Write-Log "[$ServerName] ERROR: Failed to check SQL Agent Jobs. Error: $($_.Exception.Message). Ensure MSDB database is accessible and permissions are correct." "ERROR"
+        $script:alerts += "[$ServerName] Warning: Failed to check SQL Agent Jobs. Error: $($_.Exception.Message)"
+        Insert-AlertToDB -ServerName $ServerName -AlertLevel "ERROR" -AlertCategory "Availability:AgentJob" -Message "Failed to check SQL Agent Jobs. Error: $($_.Exception.Message)"
+    }
+}
+
+# Function to check database backup status
+function Check-Backups {
+    param (
+        [string]$ServerName,
+        [int]$FullBackupAgeHours = 26, # Alert if last full backup is older than 26 hours
+        [int]$DiffBackupAgeHours = 14, # Alert if last diff backup is older than 14 hours
+        [int]$LogBackupAgeMinutes = 15 # Alert if last log backup is older than 15 minutes (for FULL/BULK_LOGGED recovery model)
+    )
+    $backupQuery = @"
+    WITH LastBackups AS (
+        SELECT
+            database_name AS DatabaseName,
+            MAX(CASE WHEN type = 'D' THEN backup_finish_date ELSE NULL END) AS LastFullBackupDate,
+            MAX(CASE WHEN type = 'I' THEN backup_finish_date ELSE NULL END) AS LastDifferentialBackupDate,
+            MAX(CASE WHEN type = 'L' THEN backup_finish_date ELSE NULL END) AS LastLogBackupDate
+        FROM msdb.dbo.backupset
+        GROUP BY database_name
+    )
+    SELECT
+        d.name AS DatabaseName,
+        d.recovery_model_desc,
+        ISNULL(lb.LastFullBackupDate, '1900-01-01') AS LastFullBackupDate,
+        ISNULL(lb.LastDifferentialBackupDate, '1900-01-01') AS LastDifferentialBackupDate,
+        ISNULL(lb.LastLogBackupDate, '1900-01-01') AS LastLogBackupDate
+    FROM sys.databases d
+    LEFT JOIN LastBackups lb ON d.name = lb.DatabaseName
+    WHERE d.state = 0
+    AND d.is_in_standby = 0
+    AND d.is_read_only = 0;
+"@
+    try {
+        Write-Log "[$ServerName] Checking database backup status..." "INFO"
+        $backupStatus = Invoke-Sqlcmd -ServerInstance $ServerName -Database "msdb" -Query $backupQuery -TrustServerCertificate -ErrorAction Stop
+
+        if ($backupStatus -and $backupStatus.Count -gt 0) {
+            $currentTime = Get-Date
+            foreach ($db in $backupStatus) {
+                # Insert into BackupStatus table
+                $insertQuery = "INSERT INTO [dbo].[BackupStatus] (ServerName, DatabaseName, RecoveryModel, LastFullBackupDate, LastDifferentialBackupDate, LastLogBackupDate) VALUES (@ServerName, @DatabaseName, @RecoveryModel, @LastFullBackupDate, @LastDifferentialBackupDate, @LastLogBackupDate);"
+                Invoke-Sqlcmd -ServerInstance $Config.MonitoringDBServer -Database $Config.MonitoringDBName `
+                    -Query $insertQuery -TrustServerCertificate -ErrorAction SilentlyContinue `
+                    -Variable @(
+                        "ServerName=$ServerName",
+                        "DatabaseName=$($db.DatabaseName)",
+                        "RecoveryModel=$($db.recovery_model_desc)",
+                        "LastFullBackupDate=$($db.LastFullBackupDate)",
+                        "LastDifferentialBackupDate=$($db.LastDifferentialBackupDate)",
+                        "LastLogBackupDate=$($db.LastLogBackupDate)"
+                    ) | Out-Null
+
+                # Check Full Backup
+                if ($db.LastFullBackupDate -eq '1900-01-01' -or (($currentTime - $db.LastFullBackupDate).TotalHours -gt $FullBackupAgeHours)) {
+                    $alertMessage = "Database '$($db.DatabaseName)' has no recent full backup! Last full backup: $($db.LastFullBackupDate). Suggestion: Verify full backup jobs are running and successful."
+                    $script:alerts += "[$ServerName] Critical Alert: " + $alertMessage
+                    Write-Log "[$ServerName] Critical Alert: " + $alertMessage "ALERT"
+                    Insert-AlertToDB -ServerName $ServerName -AlertLevel "CRITICAL" -AlertCategory "Availability:Backup" -Message $alertMessage
+                }
+                # Check Differential Backup (if exists and configured, otherwise skip this specific alert)
+                if ($db.LastDifferentialBackupDate -ne '1900-01-01' -and (($currentTime - $db.LastDifferentialBackupDate).TotalHours -gt $DiffBackupAgeHours)) {
+                    $alertMessage = "Database '$($db.DatabaseName)' last differential backup is older than $($DiffBackupAgeHours) hours! Last diff backup: $($db.LastDifferentialBackupDate). Suggestion: Verify differential backup jobs."
+                    $script:alerts += "[$ServerName] Warning: " + $alertMessage
+                    Write-Log "[$ServerName] Warning: " + $alertMessage "WARN"
+                    Insert-AlertToDB -ServerName $ServerName -AlertLevel "WARN" -AlertCategory "Availability:Backup" -Message $alertMessage
+                }
+                # Check Transaction Log Backup (for Full/Bulk-Logged recovery models)
+                if (($db.recovery_model_desc -eq 'FULL' -or $db.recovery_model_desc -eq 'BULK_LOGGED') -and ($db.LastLogBackupDate -eq '1900-01-01' -or (($currentTime - $db.LastLogBackupDate).TotalMinutes -gt $LogBackupAgeMinutes))) {
+                    $alertMessage = "Database '$($db.DatabaseName)' (Recovery Model: $($db.recovery_model_desc)) has no recent transaction log backup! Last log backup: $($db.LastLogBackupDate). Suggestion: Verify transaction log backup jobs are running frequently."
+                    $script:alerts += "[$ServerName] Critical Alert: " + $alertMessage
+                    Write-Log "[$ServerName] Critical Alert: " + $alertMessage "ALERT"
+                    Insert-AlertToDB -ServerName $ServerName -AlertLevel "CRITICAL" -AlertCategory "Availability:Backup" -Message $alertMessage
+                }
+            }
+        } else {
+            Write-Log "[$ServerName] WARN: Could not retrieve backup status. Check MSDB database accessibility or backup history." "WARN"
+            Insert-AlertToDB -ServerName $ServerName -AlertLevel "WARN" -AlertCategory "Availability:Backup" -Message "Could not retrieve backup status. Check MSDB database accessibility or backup history."
+        }
+    } catch {
+        Write-Log "[$ServerName] ERROR: Failed to check backup status. Error: $($_.Exception.Message)" "ERROR"
+        $script:alerts += "[$ServerName] Warning: Failed to check backup status. Error: $($_.Exception.Message)"
+        Insert-AlertToDB -ServerName $ServerName -AlertLevel "ERROR" -AlertCategory "Availability:Backup" -Message "Failed to check backup status. Error: $($_.Exception.Message)"
+    }
+}
+
+# Function to check for long-running transactions
+function Check-LongRunningTransactions {
+    param (
+        [string]$ServerName,
+        [int]$TransactionAgeThresholdMinutes = 10 # Alert if transaction is older than 10 minutes
+    )
+    $transactionQuery = @"
+    SELECT
+        s.session_id,
+        s.login_name,
+        s.host_name,
+        s.program_name,
+        DB_NAME(t.database_id) AS DatabaseName,
+        t.transaction_id AS SqlTransactionId,
+        at.transaction_begin_time AS TransactionBeginTime,
+        DATEDIFF(minute, at.transaction_begin_time, GETDATE()) AS TransactionAgeMinutes,
+        CASE at.transaction_type
+            WHEN 1 THEN 'Read/write transaction'
+            WHEN 2 THEN 'Read-only transaction'
+            WHEN 3 THEN 'System transaction'
+            WHEN 4 THEN 'Distributed transaction'
+            ELSE 'Unknown'
+        END AS TransactionType,
+        CASE at.transaction_state
+            WHEN 0 THEN 'Initialized'
+            WHEN 1 THEN 'Active'
+            WHEN 2 THEN 'Partially committed'
+            WHEN 3 THEN 'Partially committed (deferred)'
+            WHEN 4 THEN 'Committed'
+            WHEN 5 THEN 'Prepared'
+            WHEN 6 THEN 'Committed'
+            WHEN 7 THEN 'Rolling back'
+            WHEN 8 THEN 'Rolled back'
+            ELSE 'Unknown'
+        END AS TransactionState,
+        (SELECT text FROM sys.dm_exec_sql_text(s.sql_handle)) AS CurrentStatementText
+    FROM sys.dm_tran_session_transactions tst
+    INNER JOIN sys.dm_tran_active_transactions at ON tst.transaction_id = at.transaction_id
+    INNER JOIN sys.dm_exec_sessions s ON tst.session_id = s.session_id
+    WHERE s.is_user_process = 1
+      AND at.transaction_begin_time < DATEADD(minute, -@TransactionAgeThresholdMinutes, GETDATE())
+      AND at.transaction_state IN (1, 5)
+    ORDER BY TransactionAgeMinutes DESC;
+"@
+    try {
+        Write-Log "[$ServerName] Checking for long-running transactions..." "INFO"
+        $longTransactions = Invoke-Sqlcmd -ServerInstance $ServerName -Database "master" -Query $transactionQuery -TrustServerCertificate -ErrorAction Stop -MaxCharLength 2147483647 -QueryTimeout 60 `
+            -Variable "TransactionAgeThresholdMinutes=$TransactionAgeThresholdMinutes"
+        
+        if ($longTransactions -and $longTransactions.Count -gt 0) {
+            Write-Log "[$ServerName] ALERTS: Long-running transactions detected:" "ALERT"
+            foreach ($tran in $longTransactions) {
+                $statementPreview = ($tran.CurrentStatementText.Substring(0, [Math]::Min(100, $tran.CurrentStatementText.Length))).Replace("`r`n", " ").Replace("`n", " ")
+                $alertMessage = "Long-running transaction detected! Session ID: $($tran.session_id), User: $($tran.login_name), Host: $($tran.host_name), DB: $($tran.DatabaseName), Age: $($tran.TransactionAgeMinutes) minutes. State: $($tran.TransactionState). Statement: $statementPreview.... Suggestion: Investigate the application holding this transaction open."
+                $script:alerts += "[$ServerName] Performance Alert: " + $alertMessage
+                Write-Log "[$ServerName] Performance Alert: " + $alertMessage "ALERT"
+                Insert-AlertToDB -ServerName $ServerName -AlertLevel "ALERT" -AlertCategory "Performance:LongTransaction" -Message $alertMessage
+                
+                # Insert into LongRunningTransactions table
+                $insertQuery = "INSERT INTO [dbo].[LongRunningTransactions] (ServerName, SessionId, LoginName, HostName, ProgramName, DatabaseName, SqlTransactionId, TransactionBeginTime, TransactionAgeMinutes, TransactionType, TransactionState, CurrentStatementText) VALUES (@ServerName, @SessionId, @LoginName, @HostName, @ProgramName, @DatabaseName, @SqlTransactionId, @TransactionBeginTime, @TransactionAgeMinutes, @TransactionType, @TransactionState, @CurrentStatementText);"
+                Invoke-Sqlcmd -ServerInstance $Config.MonitoringDBServer -Database $Config.MonitoringDBName `
+                    -Query $insertQuery -TrustServerCertificate -ErrorAction SilentlyContinue `
+                    -Variable @(
+                        "ServerName=$ServerName",
+                        "SessionId=$($tran.session_id)",
+                        "LoginName=$($tran.login_name)",
+                        "HostName=$($tran.host_name)",
+                        "ProgramName=$($tran.program_name)",
+                        "DatabaseName=$($tran.DatabaseName)",
+                        "SqlTransactionId=$($tran.SqlTransactionId)",
+                        "TransactionBeginTime=$($tran.TransactionBeginTime)",
+                        "TransactionAgeMinutes=$($tran.TransactionAgeMinutes)",
+                        "TransactionType=$($tran.TransactionType)",
+                        "TransactionState=$($tran.TransactionState)",
+                        "CurrentStatementText=$($tran.CurrentStatementText)"
+                    ) | Out-Null
+            }
+        } else {
+            Write-Log "[$ServerName] INFO: No long-running transactions detected (threshold: $($TransactionAgeThresholdMinutes) minutes)." "INFO"
+        }
+    } catch {
+        Write-Log "[$ServerName] ERROR: Failed to check for long-running transactions. Error: $($_.Exception.Message)" "ERROR"
+        $script:alerts += "[$ServerName] Warning: Failed to check for long-running transactions. Error: $($_.Exception.Message)"
+        Insert-AlertToDB -ServerName $ServerName -AlertLevel "ERROR" -AlertCategory "Performance:LongTransaction" -Message "Failed to check for long-running transactions. Error: $($_.Exception.Message)"
+    }
+}
+
+# Function to check for orphaned users in user databases
+function Check-OrphanedUsers {
+    param (
+        [string]$ServerName
+    )
+    $orphanedUserQuery = @"
+    SELECT
+        dp.name AS DatabaseUserName,
+        dp.sid AS UserSID
+    FROM sys.database_principals dp
+    WHERE dp.type_desc = 'SQL_USER'
+      AND dp.authentication_type_desc = 'SQL_SERVER_AUTH'
+      AND dp.sid IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM sys.server_principals sp WHERE sp.sid = dp.sid);
+"@
+    try {
+        Write-Log "[$ServerName] Checking for orphaned users in user databases..." "INFO"
+        $dbQuery = "SELECT name FROM sys.databases WHERE database_id > 4 AND state = 0;"
+        $userDatabases = Invoke-Sqlcmd -ServerInstance $ServerName -Database "master" -Query $dbQuery -TrustServerCertificate -ErrorAction Stop
+
+        $allOrphanedUsers = @()
+        foreach ($db in $userDatabases) {
+            $dbName = $db.name
+            Write-Log "[$ServerName] Checking database '$dbName' for orphaned users..." "DEBUG"
+            $orphans = Invoke-Sqlcmd -ServerInstance $ServerName -Database $dbName -Query $orphanedUserQuery -TrustServerCertificate -ErrorAction Stop -MaxCharLength 2147483647
+            if ($orphans -and $orphans.Count -gt 0) {
+                $allOrphanedUsers += $orphans | Select-Object @{N='DatabaseName';E={$dbName}}, DatabaseUserName, UserSID
+            }
+        }
+
+        if ($allOrphanedUsers.Count -gt 0) {
+            Write-Log "[$ServerName] ALERTS: Orphaned users detected:" "ALERT"
+            foreach ($orphan in $allOrphanedUsers) {
+                $alertMessage = "Orphaned user '$($orphan.DatabaseUserName)' found in database '$($orphan.DatabaseName)'. SID: $($orphan.UserSID). Suggestion: Map to existing login using `ALTER USER ... WITH LOGIN = 'LoginName'` or drop user if no longer needed."
+                $script:alerts += "[$ServerName] Security Alert: " + $alertMessage
+                Write-Log "[$ServerName] Security Alert: " + $alertMessage "ALERT"
+                Insert-AlertToDB -ServerName $ServerName -AlertLevel "ALERT" -AlertCategory "Security:OrphanedUser" -Message $alertMessage
+                # Insert into OrphanedUsers table
+                $insertQuery = "INSERT INTO [dbo].[OrphanedUsers] (ServerName, DatabaseName, DatabaseUserName, UserSID) VALUES (@ServerName, @DatabaseName, @DatabaseUserName, @UserSID);"
+                Invoke-Sqlcmd -ServerInstance $Config.MonitoringDBServer -Database $Config.MonitoringDBName `
+                    -Query $insertQuery -TrustServerCertificate -ErrorAction SilentlyContinue `
+                    -Variable @(
+                        "ServerName=$ServerName",
+                        "DatabaseName=$($orphan.DatabaseName)",
+                        "DatabaseUserName=$($orphan.DatabaseUserName)",
+                        "UserSID=$([byte[]]$orphan.UserSID)" # Ensure SID is passed as binary
+                    ) | Out-Null
+            }
+        } else {
+            Write-Log "[$ServerName] INFO: No orphaned users found in user databases." "INFO"
+        }
+    } catch {
+        Write-Log "[$ServerName] ERROR: Failed to check for orphaned users. Error: $($_.Exception.Message)" "ERROR"
+        $script:alerts += "[$ServerName] Warning: Failed to check for orphaned users. Error: $($_.Exception.Message)"
+        Insert-AlertToDB -ServerName $ServerName -AlertLevel "ERROR" -AlertCategory "Security:OrphanedUser" -Message "Failed to check for orphaned users. Error: $($_.Exception.Message)"
+    }
+}
+
+# Function to audit server role memberships
+function Audit-ServerRoles {
+    param (
+        [string]$ServerName,
+        [string[]]$ElevatedRolesToMonitor = @('sysadmin', 'securityadmin', 'serveradmin')
+    )
+    $roleMemberQuery = @"
+    SELECT
+        sp.name AS LoginName,
+        sp.type_desc AS LoginType,
+        srp.name AS ServerRoleName
+    FROM sys.server_role_members srm
+    INNER JOIN sys.server_principals sp ON srm.member_principal_id = sp.principal_id
+    INNER JOIN sys.server_principals srp ON srm.role_principal_id = srp.principal_id
+    WHERE srp.name IN ('sysadmin', 'securityadmin', 'serveradmin', 'setupadmin', 'processadmin', 'diskadmin', 'dbcreator', 'bulkadmin');
+"@
+    try {
+        Write-Log "[$ServerName] Auditing server role memberships for elevated privileges..." "INFO"
+        $roleMembers = Invoke-Sqlcmd -ServerInstance $ServerName -Database "master" -Query $roleMemberQuery -TrustServerCertificate -ErrorAction Stop
+
+        if ($roleMembers -and $roleMembers.Count -gt 0) {
+            foreach ($role in $roleMembers) {
+                # Insert into ServerRoleAudit table
+                $insertQuery = "INSERT INTO [dbo].[ServerRoleAudit] (ServerName, LoginName, LoginType, ServerRoleName) VALUES (@ServerName, @LoginName, @LoginType, @ServerRoleName);"
+                Invoke-Sqlcmd -ServerInstance $Config.MonitoringDBServer -Database $Config.MonitoringDBName `
+                    -Query $insertQuery -TrustServerCertificate -ErrorAction SilentlyContinue `
+                    -Variable @(
+                        "ServerName=$ServerName",
+                        "LoginName=$($role.LoginName)",
+                        "LoginType=$($role.LoginType)",
+                        "ServerRoleName=$($role.ServerRoleName)"
+                    ) | Out-Null
+
+                if ($ElevatedRolesToMonitor -contains $role.ServerRoleName) {
+                    $alertMessage = "Login '$($role.LoginName)' (Type: $($role.LoginType)) is a member of the highly privileged server role: '$($role.ServerRoleName)'. Suggestion: Review if this privilege is strictly necessary and follow least privilege principle."
+                    $script:alerts += "[$ServerName] Security Alert: " + $alertMessage
+                    Write-Log "[$ServerName] Security Alert: " + $alertMessage "ALERT"
+                    Insert-AlertToDB -ServerName $ServerName -AlertLevel "ALERT" -AlertCategory "Security:ServerRole" -Message $alertMessage
+                }
+            }
+        } else {
+            Write-Log "[$ServerName] INFO: No logins found in monitored elevated server roles." "INFO"
+        }
+    } catch {
+        Write-Log "[$ServerName] ERROR: Failed to audit server roles. Error: $($_.Exception.Message)" "ERROR"
+        $script:alerts += "[$ServerName] Warning: Failed to audit server roles. Error: $($_.Exception.Message)"
+        Insert-AlertToDB -ServerName $ServerName -AlertLevel "ERROR" -AlertCategory "Security:ServerRole" -Message "Failed to audit server roles. Error: $($_.Exception.Message)"
+    }
+}
+
+#endregion
+
+#region Main Monitoring Logic
+
+function Start-SQLGuardian {
+    [CmdletBinding()]
+    param (
+        # This parameter is now redundant as it's handled by the script's main param block
+        # and the $script:InteractiveMode flag.
+        # [switch]$Interactive
+    )
+
+    # The server list is already populated in the global scope.
+    # Use the global $ServerList variable.
+    $selectedServers = $ServerList # Initially, all servers are selected
+
+    if ($script:InteractiveMode) {
+        #region Interactive Mode
+        $selectedServers = $ServerList
+        $script:interactiveLogFile = "$($Config.LogDir)\SQLGuardian_Interactive_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+        Write-Log "Welcome to SQLGuardian Interactive Mode! Monitoring servers: $($ServerList -join ', '). Type 'exit' to quit." "INFO"
+
+        while ($true) {
+            $command = Read-Host "`nEnter command (e.g., 'missing index', 'recent logins', 'deadlocks', 'blocking', 'duplicate indexes', 'analyze queries', 'performance', 'fragmentation', 'disk space', 'agent jobs', 'backups', 'long transactions', 'orphaned users', 'server roles', 'select servers', 'exit')"
+            Write-Log "Command entered: $command" "DEBUG"
+            $script:alerts.Clear() # Clear alerts for each new interactive command
+
+            switch -Wildcard ($command.ToLower()) {
+                "select servers" {
+                    Write-Log "Available servers: $($ServerList -join ', ')" "INFO"
+                    $inputServers = Read-Host "Enter server names (comma-separated, or 'all' for all servers)"
+                    if ($inputServers -eq 'all') {
+                        $selectedServers = $ServerList
+                    } else {
+                        $selectedServers = $inputServers -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $ServerList -contains $_ }
+                        if (-not $selectedServers) {
+                            Write-Log "No valid servers selected. Using all servers for this session." "WARN"
+                            $selectedServers = $ServerList
+                        }
+                    }
+                    Write-Log "Selected servers for current interactive session: $($selectedServers -join ', ')" "INFO"
+                }
+                "missing index" {
+                    foreach ($ServerName in $selectedServers) {
+                        Write-Log "`nRunning 'missing index' check on $ServerName..." "INFO"
+                        # Instead of re-running the query here, call the function that stores to DB
+                        Check-Performance -ServerName $ServerName # This function includes missing index check
+                    }
+                }
+                "recent logins" {
+                    foreach ($ServerName in $selectedServers) {
+                        Write-Log "`nRunning 'recent logins' check on $ServerName..." "INFO"
+                        Check-FailedLogins -ServerName $ServerName -TimeWindowMinutes 15
+
+                        $logFile = "$($Config.LogDir)\FailedLogins_$ServerName.csv"
+                        if (-not (Test-Path $logFile)) {
+                            Write-Log "[$ServerName] INFO: Failed logins log file '$logFile' does not exist. No data to display." "INFO"
+                            continue
+                        }
+                        try {
+                            $csvContent = Import-Csv $logFile -ErrorAction Stop
+                        } catch {
+                            Write-Log "[$ServerName] ERROR: Failed to import CSV file '$logFile'. Error: $($_.Exception.Message)" "ERROR"
+                            continue
+                        }
+
+                        if (-not $csvContent -or $csvContent.Count -eq 0) {
+                            Write-Log "[$ServerName] INFO: Failed logins log file '$logFile' is empty. No data to display." "INFO"
+                            continue
+                        }
+
+                        $currentTime = Get-Date
+                        $recentLogins = @()
+                        $csvContent | ForEach-Object {
+                            try {
+                                $timestamp = [datetime]::ParseExact($_.Timestamp, "MM/dd/yyyy HH:mm:ss", [System.Globalization.CultureInfo]::InvariantCulture)
+                                $cutoffTime = $currentTime.AddMinutes(-15)
+                                if ($timestamp -gt $cutoffTime) {
+                                    $recentLogins += $_
+                                }
+                            } catch {
+                                Write-Log "[$ServerName] WARN: Skipping invalid timestamp '$($_.Timestamp)' in CSV during recent login display. Error: $_" "WARN"
+                            }
+                        }
+                        if ($recentLogins.Count -gt 0) {
+                            Write-Log "Recent failed logins (last 15 minutes) on ${ServerName}:" "INFO"
+                            $recentLogins | Format-Table -Property Timestamp, User, Reason, ClientIP -AutoSize
+                            $recentLogins | Format-Table -Property Timestamp, User, Reason, ClientIP -AutoSize | Out-String | Add-Content -Path $script:interactiveLogFile
+                        } else {
+                            Write-Log "No recent failed logins detected in the last 15 minutes on $ServerName." "INFO"
+                        }
+                    }
+                }
+                "deadlocks" {
+                    foreach ($ServerName in $selectedServers) {
+                        Write-Log "`nRunning 'deadlocks' check on $ServerName..." "INFO"
+                        Check-Deadlocks -ServerName $ServerName
+                    }
+                }
+                "blocking" {
+                    foreach ($ServerName in $selectedServers) {
+                        Write-Log "`nRunning 'blocking' check on $ServerName..." "INFO"
+                        Check-BlockingSessions -ServerName $ServerName
+                    }
+                }
+                "duplicate indexes" {
+                    foreach ($ServerName in $selectedServers) {
+                        Write-Log "`nRunning 'duplicate indexes' check on $ServerName..." "INFO"
+                        Check-DuplicateIndexes -ServerName $ServerName
+                    }
+                }
+                "analyze queries" {
+                    foreach ($ServerName in $selectedServers) {
+                        Write-Log "`nRunning 'query resource analysis' on $ServerName..." "INFO"
+                        Analyze-QueryResourceUtilization -ServerName $ServerName
+                    }
+                }
+                "performance" {
+                    foreach ($ServerName in $selectedServers) {
+                        Write-Log "`nRunning comprehensive 'performance' check on $ServerName (includes slow queries, missing indexes, CPU usage)." "INFO"
+                        Check-Performance -ServerName $ServerName
+                    }
+                }
+                "fragmentation" {
+                    foreach ($ServerName in $selectedServers) {
+                        Write-Log "`nRunning 'index fragmentation' check on $ServerName..." "INFO"
+                        # This function was not defined in the provided script. 
+                        # Assuming it exists elsewhere or adding a placeholder.
+                        # Check-IndexFragmentation -ServerName $ServerName
+                        Write-Log "[$ServerName] 'Check-IndexFragmentation' is not implemented in this version." "WARN"
+                    }
+                }
+                "disk space" {
+                    foreach ($ServerName in $selectedServers) {
+                        Write-Log "`nRunning 'disk space and growth' check on $ServerName..." "INFO"
+                        Check-DiskSpaceAndGrowth -ServerName $ServerName
+                    }
+                }
+                "agent jobs" {
+                    foreach ($ServerName in $selectedServers) {
+                        Write-Log "`nRunning 'SQL Agent jobs' check on $ServerName..." "INFO"
+                        Check-AgentJobs -ServerName $ServerName
+                    }
+                }
+                "backups" {
+                    foreach ($ServerName in $selectedServers) {
+                        Write-Log "`nRunning 'database backup status' check on $ServerName..." "INFO"
+                        Check-Backups -ServerName $ServerName
+                    }
+                }
+                "long transactions" {
+                    foreach ($ServerName in $selectedServers) {
+                        Write-Log "`nRunning 'long running transactions' check on $ServerName..." "INFO"
+                        Check-LongRunningTransactions -ServerName $ServerName
+                    }
+                }
+                "orphaned users" {
+                    foreach ($ServerName in $selectedServers) {
+                        Write-Log "`nRunning 'orphaned users' check on $ServerName..." "INFO"
+                        Check-OrphanedUsers -ServerName $ServerName
+                    }
+                }
+                "server roles" {
+                    foreach ($ServerName in $selectedServers) {
+                        Write-Log "`nRunning 'server roles audit' on $ServerName..." "INFO"
+                        Audit-ServerRoles -ServerName $ServerName
+                    }
+                }
+                "exit" {
+                    Write-Log "Exiting SQLGuardian Interactive Mode. Goodbye!" "INFO"
+                    break
+                }
+                default {
+                    Write-Log "Unknown command. Please use one of the listed commands." "INFO"
+                }
+            }
+            # Display any alerts collected from the current interactive command
+            if ($script:alerts.Count -gt 0) {
+                Write-Log "`n--- Summary of Alerts for current command ---" "INFO"
+                $script:alerts | ForEach-Object { Write-Log $_ "ALERT" }
+                Write-Log "------------------------------------------" "INFO"
+            }
+        }
+        #endregion
+    } else {
+        #region Automated Mode (for SQL Server Agent Jobs, Scheduled Tasks)
+        $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+        $script:agentLogFile = "$($Config.LogDir)\SQLGuardian_Agent_$timestamp.log"
+        Write-Log "SQL Guardian Monitoring started at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') for servers: $($ServerList -join ', ')" "INFO"
+
+        foreach ($ServerName in $ServerList) {
+            Write-Log "`n--- Starting monitoring for $ServerName ---" "INFO"
+            $script:alerts = @() # Clear alerts for each new server in automated mode
+
+            # Perform all defined checks and ingest data into DB
+            Check-FailedLogins -ServerName $ServerName -TimeWindowMinutes 15
+            Check-EncryptionStatus -ServerName $ServerName
+            Check-Performance -ServerName $ServerName
+            Check-Deadlocks -ServerName $ServerName
+            Check-BlockingSessions -ServerName $ServerName
+            Check-DuplicateIndexes -ServerName $ServerName
+            Analyze-QueryResourceUtilization -ServerName $ServerName
+            #Check-IndexFragmentation -ServerName $ServerName
+            Check-DiskSpaceAndGrowth -ServerName $ServerName
+            Check-AgentJobs -ServerName $ServerName
+            # The Check-IndexFragmentation function is not defined in the script.
+            # If you have it, you can uncomment the line below.
+            # Check-IndexFragmentation -ServerName $ServerName
+
+            Check-Backups -ServerName $ServerName
+            Check-LongRunningTransactions -ServerName $ServerName
+            Check-OrphanedUsers -ServerName $ServerName
+            Audit-ServerRoles -ServerName $ServerName
+
+            # Python anomaly detection for failed logins
+            $pythonScript = @"
+import pandas as pd
+import pickle
+from sklearn.ensemble import IsolationForest
+import os
+import sys
+import pyodbc # For inserting into SQL Server
+
+# Configuration from PowerShell
+log_dir = '$($Config.LogDir)'
+model_dir = '$($Config.ModelDir)'
+server_name = '$ServerName'
+monitoring_db_server = '$($Config.MonitoringDBServer)'
+monitoring_db_name = '$($Config.MonitoringDBName)'
+
+failed_logins_csv = os.path.join(log_dir, f'FailedLogins_{server_name}.csv')
+model_path = os.path.join(model_dir, 'login_anomaly_model.pkl')
+
+# --- Data Loading and Preprocessing ---
+if not os.path.exists(failed_logins_csv):
+    print(f'No failed logins CSV found for {server_name} at {failed_logins_csv}. Skipping anomaly detection.')
+    sys.exit()
+
+try:
+    data = pd.read_csv(failed_logins_csv)
+except pd.errors.EmptyDataError:
+    print(f'Failed logins CSV for {server_name} is empty. Skipping anomaly detection.')
+    sys.exit()
+except Exception as e:
+    print(f'Error reading failed logins CSV for {server_name}: {e}. Skipping anomaly detection.')
+    sys.exit()
+
+data['Timestamp'] = pd.to_datetime(data['Timestamp'], format='mixed', errors='coerce')
+data = data.dropna(subset=['Timestamp'])
+data = data.drop_duplicates(subset=['Timestamp', 'User', 'ServerName'])
+
+now = pd.Timestamp.now(tz='UTC')
+cutoff = now - pd.Timedelta(minutes=15)
+recent_logins = data[data['Timestamp'] > cutoff].copy()
+
+if recent_logins.empty:
+    print(f'No recent failed logins detected within the last 15 minutes for {server_name}. Skipping anomaly detection.')
+    sys.exit()
+
+# --- Feature Engineering ---
+recent_logins.loc[:, 'Hour'] = recent_logins['Timestamp'].dt.hour
+recent_logins.loc[:, 'DayOfWeek'] = recent_logins['Timestamp'].dt.dayofweek
+
+recent_logins = recent_logins.sort_values(['User', 'Timestamp'])
+recent_logins['TimeDiff'] = recent_logins.groupby('User')['Timestamp'].diff().dt.total_seconds()
+recent_logins['TimeDiff'] = recent_logins['TimeDiff'].fillna(900)
+
+avg_time_diff = recent_logins.groupby(['ServerName', 'User'])['TimeDiff'].mean().reset_index(name='AvgTimeBetweenLogins')
+login_counts = (recent_logins.groupby(['ServerName', 'User', 'Hour', 'DayOfWeek'])
+                             .size()
+                             .reset_index(name='LoginCount'))
+
+features = login_counts.merge(avg_time_diff, on=['ServerName', 'User'], how='left')
+X = features[['Hour', 'DayOfWeek', 'LoginCount', 'AvgTimeBetweenLogins']].copy()
+
+if X.empty:
+    print(f'No valid features generated for anomaly detection on {server_name}. Skipping anomaly detection.')
+    sys.exit()
+
+# --- Model Loading and Prediction ---
+if not os.path.exists(model_path):
+    print(f'Anomaly detection model not found at {model_path}. Skipping anomaly detection. Please train and save the model.')
+    sys.exit()
+
+try:
+    with open(model_path, 'rb') as f:
+        model = pickle.load(f)
+
+    if isinstance(model, IsolationForest):
+        if not hasattr(model, 'contamination') or model.contamination is None:
+            model.set_params(contamination=0.05)
+
+    predictions = model.predict(X)
+
+    # --- Anomaly Reporting & DB Ingestion ---
+    anomalies_detected = False
+    for idx in (predictions == -1).nonzero()[0]:
+        anomaly_data = features.iloc[idx]
+        anomaly_message = f'User "{anomaly_data["User"]}" had {anomaly_data["LoginCount"]} logins with an average time between logins of {anomaly_data["AvgTimeBetweenLogins"]:.2f} seconds (Hour: {anomaly_data["Hour"]}, DayOfWeek: {anomaly_data["DayOfWeek"]}).'
+        print(f'Anomaly detected on {anomaly_data["ServerName"]}: {anomaly_message}')
+        anomalies_detected = True
+
+        # Insert anomaly into LoginAnomalies table
+        try:
+            cnxn = pyodbc.connect(f'DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={monitoring_db_server};DATABASE={monitoring_db_name};UID=;PWD=;Integrated Security=True')
+            cursor = cnxn.cursor()
+            insert_sql = """
+            INSERT INTO [dbo].[LoginAnomalies] (ServerName, UserName, LoginCount, AvgTimeBetweenLoginsSeconds, Hour, DayOfWeek, AnomalyMessage)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """
+            cursor.execute(insert_sql,
+                           server_name,
+                           anomaly_data['User'],
+                           int(anomaly_data['LoginCount']),
+                           float(anomaly_data['AvgTimeBetweenLogins']),
+                           int(anomaly_data['Hour']),
+                           int(anomaly_data['DayOfWeek']),
+                           anomaly_message)
+            cnxn.commit()
+            cursor.close()
+            cnxn.close()
+        except Exception as db_e:
+            print(f'ERROR: Failed to insert anomaly into LoginAnomalies DB table: {db_e}', file=sys.stderr)
+            # Do not exit, just log DB error, anomaly might still be reported in PowerShell logs
+
+    if not anomalies_detected:
+        print(f'No anomalies detected for {server_name}.')
+
+except Exception as e:
+    print(f'Error during Python anomaly detection for {server_name}: {e}', file=sys.stderr)
+    sys.exit(1)
+"@
+            # Execute the Python script and capture output
+            $anomaliesOutput = Invoke-PythonScript -ScriptContent $pythonScript -ServerName $ServerName
+
+            if ($anomaliesOutput) {
+                foreach ($line in $anomaliesOutput -split "`n") {
+                    if ($line -match "Anomaly detected") {
+                        $script:alerts += "[$ServerName] Anomaly Alert: $line"
+                        Write-Log "[$ServerName] Anomaly Alert: $line" "ALERT"
+                    } elseif ($line -match "No recent failed logins" -or $line -match "Skipping anomaly detection" -or $line -match "Error reading failed logins CSV" -or $line -match "ERROR: Failed to insert anomaly") {
+                        Write-Log "[$ServerName] INFO: $line" "INFO"
+                    } else {
+                        Write-Log "[$ServerName] DEBUG: Python output: $line" "DEBUG"
+                    }
+                }
+            } else {
+                Write-Log "[$ServerName] No specific anomaly detection output or Python script failed unexpectedly." "WARN"
+            }
+
+            # Handle and send alerts for the current server
+            $serverLogFile = "$($Config.LogDir)\SQLGuardian_$ServerName.log"
+            if ($script:alerts.Count -gt 0) { 
+                Write-Log "`n[$ServerName] --- Summary of ALERTS for this run at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') ---" "WARN"
+                $script:alerts | ForEach-Object {
+                    Write-Log "- $_" "ALERT"
+                }
+                $logEntry = "`n--- Alerts for [$ServerName] on $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') ---`n" + ($script:alerts -join "`n") + "`n"
+                Add-Content -Path $serverLogFile -Value $logEntry -Encoding UTF8
+
+                if (-not $Config.SmtpServer -or -not $Config.SmtpPort -or -not $Config.SmtpUsername -or -not $Config.SmtpPassword -or -not $Config.EmailTo -or -not $Config.EmailFrom) {
+                    Write-Log "[$ServerName] ERROR: Incomplete SMTP configuration. Email alerts cannot be sent. Please check SmtpServer, SmtpPort, SmtpUsername, SmtpPassword, EmailTo, and EmailFrom settings." "ERROR"
+                } else {
+                    try {
+                        $plainPassword = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto([System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($Config.SmtpPassword))
+
+                        $smtpCred = New-Object System.Management.Automation.PSCredential ($Config.SmtpUsername, (ConvertTo-SecureString $plainPassword -AsPlainText -Force))
+                        Send-MailMessage -To $Config.EmailTo -From $Config.EmailFrom `
+                            -Subject "SQL Guardian Alerts for $ServerName at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" `
+                            -Body ($script:alerts -join "`n") `
+                            -SmtpServer $Config.SmtpServer -Port $Config.SmtpPort `
+                            -Credential $smtpCred -UseSsl -ErrorAction Stop
+
+                        Write-Log "[$ServerName] INFO: Email sent successfully to $($Config.EmailTo) for this server." "INFO"
+                    } catch {
+                        Write-Log "[$ServerName] ERROR: Failed to send email: $($_.Exception.Message). Check SMTP settings and network connectivity." "ERROR"
+                    } finally {
+                        if ($plainPassword) {
+                            $plainPassword = $null
+                            [GC]::Collect()
+Navigation Menu
+wondisha
+sql-monitoring-tool
+
+Type / to search
+Code
+Issues
+Pull requests
+Actions
+Projects
+Wiki
+Security
+Insights
+Settings
+sql-monitoring-tool
+/
+SG_G
+in
+main
+
+
+                        }
+                    }
+                }
+            } else {
+                Write-Log "[$ServerName] INFO: No security or performance issues detected during this run." "INFO"
+            }
+            Write-Log "--- Finished monitoring for $ServerName ---" "INFO"
+        }
+        Write-Log "SQL Guardian Monitoring completed at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')." "INFO"
+        #endregion
+    }
+}
+
+#endregion
+
+#region Script Execution Entry Point
+
+# Get the list of servers to monitor before starting
+$ServerList = Get-ServerListFromDB -Server $CentralDBServer -Database $CentralDBName
+
+# Determine execution mode and start SQLGuardian
+if ($Interactive) {
+    Start-SQLGuardian
+} else {
+    Start-SQLGuardian
+}
+
+#endregion
+
