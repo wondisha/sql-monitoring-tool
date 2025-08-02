@@ -385,4 +385,413 @@ function Check-Performance {
                 }
             }
         } else {
-            Write-Log "[$ServerName] INFO: No significantly slow
+            Write-Log "[$ServerName] INFO: No significantly slow queries detected." "INFO"
+        }
+    } catch {
+        Write-Log "[$ServerName] ERROR: Failed to query slow queries. Error: $($_.Exception.Message)" "ERROR"
+        $script:alerts += "[$ServerName] Warning: Failed to query slow queries. Error: $($_.Exception.Message)"
+        Insert-AlertToDB -ServerName $ServerName -AlertLevel "ERROR" -AlertCategory "Performance:Query" -Message "Failed to query slow queries. Error: $($_.Exception.Message)"
+    }
+
+    # Check Missing Indexes (already provides suggestions)
+    try {
+        Write-Log "[$ServerName] Checking for missing indexes..." "INFO"
+        $missingIndexes = Invoke-Sqlcmd -ServerInstance $ServerName -Database "master" -Query $indexQuery -TrustServerCertificate -ErrorAction Stop
+        if ($missingIndexes -and $missingIndexes.Count -gt 0) {
+            foreach ($index in $missingIndexes) {
+                $alertMessage = "Missing index in database '$($index.database_name)' on '$($index.table_name)' with impact $($index.avg_user_impact)%. Suggestion: Consider creating an index on columns: $($index.equality_columns) INCLUDES ($($index.inequality_columns))."
+                $script:alerts += "[$ServerName] Performance Alert: " + $alertMessage
+                Write-Log "[$ServerName] Performance Alert: " + $alertMessage "ALERT"
+                Insert-AlertToDB -ServerName $ServerName -AlertLevel "ALERT" -AlertCategory "Performance:MissingIndex" -Message $alertMessage
+            }
+        } else {
+            Write-Log "[$ServerName] INFO: No missing indexes detected with impact > 50% in any user database." "INFO"
+        }
+    } catch {
+        Write-Log "[$ServerName] ERROR: Failed to query missing indexes. Error: $($_.Exception.Message)" "ERROR"
+        $script:alerts += "[$ServerName] Warning: Failed to query missing indexes. Error: $($_.Exception.Message)"
+        Insert-AlertToDB -ServerName $ServerName -AlertLevel "ERROR" -AlertCategory "Performance:MissingIndex" -Message "Failed to query missing indexes. Error: $($_.Exception.Message)"
+    }
+
+    # Check CPU Usage
+    try {
+        Write-Log "[$ServerName] Checking CPU usage..." "INFO"
+        $cpuUsage = Invoke-Sqlcmd -ServerInstance $ServerName -Database "master" -Query $cpuQuery -TrustServerCertificate -ErrorAction Stop
+        if ($cpuUsage -and ($cpuUsage.SystemIdlePercent -ne $null) -and ($cpuUsage.SQLProcessUtilizationPercent -ne $null)) {
+            Write-Log "[$ServerName] INFO: CPU Usage (last 15 minutes): System Idle: $($cpuUsage.SystemIdlePercent)%, SQL Process Utilization: $($cpuUsage.SQLProcessUtilizationPercent)%" "INFO"
+            if ($cpuUsage.SQLProcessUtilizationPercent -gt 80) { # High CPU usage threshold
+                $alertMessage = "High SQL Server CPU usage detected ($($cpuUsage.SQLProcessUtilizationPercent)% > 80%) over the last 15 minutes. Suggestion: Investigate active queries and server workload using Query Store or activity monitor."
+                $script:alerts += "[$ServerName] Performance Alert: " + $alertMessage
+                Write-Log "[$ServerName] Performance Alert: " + $alertMessage "ALERT"
+                Insert-AlertToDB -ServerName $ServerName -AlertLevel "ALERT" -AlertCategory "Performance:CPU" -Message $alertMessage
+            }
+        } else {
+            $script:alerts += "[$ServerName] Warning: No valid CPU usage data available for the last 15 minutes."
+            Write-Log "[$ServerName] WARN: No valid CPU usage data available for the last 15 minutes." "WARN"
+            Insert-AlertToDB -ServerName $ServerName -AlertLevel "WARN" -AlertCategory "Performance:CPU" -Message "No valid CPU usage data available for the last 15 minutes."
+        }
+    } catch {
+        $errorMessage = "Failed to retrieve CPU usage. Error: $($_.Exception.Message)"
+        Write-Log "[$ServerName] ERROR: " + $errorMessage "ERROR"
+        Write-Log "[$ServerName] DEBUG: SQL Error Details: $($_.Exception.InnerException.Message)" "DEBUG"
+        Write-Log "[$ServerName] INFO: Skipping CPU usage check due to error." "INFO"
+        $script:alerts += "[$ServerName] Warning: " + $errorMessage
+        Insert-AlertToDB -ServerName $ServerName -AlertLevel "ERROR" -AlertCategory "Performance:CPU" -Message "Failed to retrieve CPU usage. Error: $($_.Exception.Message)"
+    }
+}
+
+# Function to check for deadlocks using Extended Events
+function Check-Deadlocks {
+    param (
+        [string]$ServerName
+    )
+    $deadlockQuery = @"
+    DECLARE @xml XML;
+    SELECT @xml = target_data
+    FROM sys.dm_xe_session_targets xt
+    JOIN sys.dm_xe_sessions xs ON xs.address = xt.event_session_address
+    WHERE xs.name = 'system_health'
+    AND xt.target_name = 'ring_buffer';
+
+    SELECT
+        XEventData.XEvent.value('(data/value)[1]', 'NVARCHAR(MAX)') AS deadlock_graph,
+        XEventData.XEvent.value('@timestamp', 'DATETIME') AS event_time
+    FROM @xml.nodes('//RingBufferTarget/event[@name="xml_deadlock_report"]') AS XEventData(XEvent)
+    ORDER BY event_time DESC;
+"@
+    try {
+        Write-Log "[$ServerName] Checking for recent deadlocks..." "INFO"
+        $deadlocks = Invoke-Sqlcmd -ServerInstance $ServerName -Database "master" -Query $deadlockQuery -TrustServerCertificate -ErrorAction Stop
+        if ($deadlocks -and $deadlocks.Count -gt 0) {
+            Write-Log "[$ServerName] ALERTS: Found $($deadlocks.Count) deadlock(s):" "ALERT"
+            foreach ($deadlock in $deadlocks) {
+                $timestamp = $deadlock.event_time.ToString('yyyyMMdd_HHmmss')
+                $deadlockFileName = "$($Config.LogDir)\Deadlock_$ServerName_$timestamp.xml"
+                $deadlock.deadlock_graph | Out-File -FilePath $deadlockFileName -Encoding UTF8 # Save full XML
+
+                $deadlockPreview = ($deadlock.deadlock_graph.Substring(0, [Math]::Min(200, $deadlock.deadlock_graph.Length))).Replace("`r`n", " ").Replace("`n", " ")
+
+                $alertMessage = "Deadlock detected at $($deadlock.event_time). Details saved to $deadlockFileName. Preview: $deadlockPreview..."
+                $script:alerts += "[$ServerName] Deadlock Alert: " + $alertMessage
+                Write-Log "[$ServerName] Deadlock Alert: " + $alertMessage "ALERT"
+                Insert-AlertToDB -ServerName $ServerName -AlertLevel "ALERT" -AlertCategory "Performance:Deadlock" -Message $alertMessage
+            }
+        } else {
+            Write-Log "[$ServerName] INFO: No recent deadlocks detected." "INFO"
+        }
+    } catch {
+        Write-Log "[$ServerName] ERROR: Failed to check deadlocks. Error: $($_.Exception.Message)" "ERROR"
+        $script:alerts += "[$ServerName] Warning: Failed to check deadlocks. Error: $($_.Exception.Message)"
+        Insert-AlertToDB -ServerName $ServerName -AlertLevel "ERROR" -AlertCategory "Performance:Deadlock" -Message "Failed to check deadlocks. Error: $($_.Exception.Message)"
+    }
+}
+
+# Function to check for blocking sessions
+function Check-BlockingSessions {
+    param (
+        [string]$ServerName
+    )
+    $blockingQuery = @"
+    SELECT
+        r.blocking_session_id AS BlockingSessionID,
+        r.session_id AS BlockedSessionID,
+        DB_NAME(r.database_id) AS DatabaseName,
+        CASE
+            WHEN r.wait_resource LIKE 'OBJECT:%' THEN
+                OBJECT_NAME(CAST(PARSENAME(r.wait_resource, 1) AS INT), r.database_id)
+            ELSE r.wait_resource
+        END AS ResourceAffected,
+        r.wait_type,
+        r.wait_time AS WaitTimeMS,
+        (SELECT text FROM sys.dm_exec_sql_text(r.sql_handle)) AS BlockedQuery,
+        (SELECT text FROM sys.dm_exec_sql_text(c.most_recent_sql_handle)) AS BlockingQuery
+    FROM sys.dm_exec_requests r
+    LEFT JOIN sys.dm_exec_sessions s ON r.blocking_session_id = s.session_id
+    LEFT JOIN sys.dm_exec_connections c ON s.session_id = c.session_id
+    WHERE r.blocking_session_id <> 0;
+"@
+    try {
+        Write-Log "[$ServerName] Checking for blocking sessions..." "INFO"
+        $blockingSessions = Invoke-Sqlcmd -ServerInstance $ServerName -Database "master" -Query $blockingQuery -TrustServerCertificate -ErrorAction Stop
+        if ($blockingSessions -and $blockingSessions.Count -gt 0) {
+            Write-Log "[$ServerName] ALERTS: Current blocking sessions detected:" "ALERT"
+            foreach ($session in $blockingSessions) {
+                $blockedQueryPreview = ($session.BlockedQuery.Substring(0, [Math]::Min(100, $session.BlockedQuery.Length))).Replace("`r`n", " ").Replace("`n", " ")
+                $blockingQueryPreview = ($session.BlockingQuery.Substring(0, [Math]::Min(100, $session.BlockingQuery.Length))).Replace("`r`n", " ").Replace("`n", " ")
+
+                $alertMessage = "BlockingSessionID: $($session.BlockingSessionID), BlockedSessionID: $($session.BlockedSessionID). Database: $($session.DatabaseName), Resource: $($session.ResourceAffected), WaitType: $($session.wait_type), WaitTime: $($session.WaitTimeMS)ms. Blocked Query: $blockedQueryPreview..., Blocking Query: $blockingQueryPreview.... Suggestion: Investigate the blocking query and consider transaction isolation levels."
+                $script:alerts += "[$ServerName] Blocking Alert: " + $alertMessage
+                Write-Log "[$ServerName] Blocking Alert: " + $alertMessage "ALERT"
+                Insert-AlertToDB -ServerName $ServerName -AlertLevel "ALERT" -AlertCategory "Performance:Blocking" -Message $alertMessage
+            }
+        } else {
+            Write-Log "[$ServerName] INFO: No blocking sessions detected." "INFO"
+        }
+    } catch {
+        Write-Log "[$ServerName] ERROR: Failed to check blocking sessions. Error: $($_.Exception.Message)" "ERROR"
+        $script:alerts += "[$ServerName] Warning: Failed to check blocking sessions. Error: $($_.Exception.Message)"
+        Insert-AlertToDB -ServerName $ServerName -AlertLevel "ERROR" -AlertCategory "Performance:Blocking" -Message "Failed to check blocking sessions. Error: $($_.Exception.Message)"
+    }
+}
+
+# Function to detect duplicate indexes
+function Check-DuplicateIndexes {
+    param (
+        [string]$ServerName
+    )
+    $duplicateIndexQuery = @"
+    WITH IndexColumns AS (
+        SELECT
+            DB_ID() AS database_id,
+            i.object_id,
+            OBJECT_SCHEMA_NAME(i.object_id) AS SchemaName,
+            OBJECT_NAME(i.object_id) AS TableName,
+            i.index_id,
+            i.name AS IndexName,
+            i.type_desc,
+            STUFF((
+                SELECT ', ' + COL_NAME(ic.object_id, ic.column_id) +
+                       CASE WHEN ic.is_descending_key = 1 THEN ' DESC' ELSE ' ASC' END
+                FROM sys.index_columns ic
+                WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.is_included_column = 0
+                ORDER BY ic.key_ordinal
+                FOR XML PATH('')
+            ), 1, 2, '') AS KeyColumns,
+            STUFF((
+                SELECT ', ' + COL_NAME(ic.object_id, ic.column_id)
+                FROM sys.index_columns ic
+                WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.is_included_column = 1
+                ORDER BY ic.column_id
+                FOR XML PATH('')
+            ), 1, 2, '') AS IncludedColumns
+        FROM sys.indexes i
+        WHERE i.is_hypothetical = 0
+          AND i.is_primary_key = 0
+          AND i.is_unique_constraint = 0
+          AND i.type IN (1, 2)
+    ),
+    DuplicateSignatures AS (
+        SELECT
+            SchemaName,
+            TableName,
+            KeyColumns,
+            IncludedColumns,
+            COUNT(*) AS NumberOfDuplicates
+        FROM IndexColumns
+        WHERE KeyColumns IS NOT NULL
+        GROUP BY SchemaName, TableName, KeyColumns, IncludedColumns
+        HAVING COUNT(*) > 1
+    )
+    SELECT
+        ds.SchemaName,
+        ds.TableName,
+        ds.KeyColumns,
+        ds.IncludedColumns,
+        ds.NumberOfDuplicates,
+        STUFF((
+            SELECT ', ' + ic.IndexName + ' (' + ic.type_desc + ')'
+            FROM IndexColumns ic
+            WHERE ic.SchemaName = ds.SchemaName
+              AND ic.TableName = ds.TableName
+              AND ic.KeyColumns = ds.KeyColumns
+              AND ISNULL(ic.IncludedColumns, '') = ISNULL(ds.IncludedColumns, '')
+            ORDER BY ic.IndexName
+            FOR XML PATH('')
+        ), 1, 2, '') AS DuplicateIndexesList
+    FROM DuplicateSignatures ds
+    ORDER BY ds.SchemaName, ds.TableName, ds.KeyColumns;
+"@
+
+    try {
+        Write-Log "[$ServerName] Checking for duplicate indexes across user databases..." "INFO"
+        $dbQuery = "SELECT name FROM sys.databases WHERE database_id > 4 AND state = 0;"
+        $userDatabases = Invoke-Sqlcmd -ServerInstance $ServerName -Database "master" -Query $dbQuery -TrustServerCertificate -ErrorAction Stop
+
+        $allDuplicateIndexes = @()
+        foreach ($db in $userDatabases) {
+            $dbName = $db.name
+            Write-Log "[$ServerName] Checking database '$dbName' for duplicate indexes..." "DEBUG"
+            $duplicates = Invoke-Sqlcmd -ServerInstance $ServerName -Database $dbName -Query $duplicateIndexQuery -TrustServerCertificate -ErrorAction Stop -MaxCharLength 2147483647
+            if ($duplicates -and $duplicates.Count -gt 0) {
+                $allDuplicateIndexes += $duplicates | Select-Object @{N='DatabaseName';E={$dbName}}, SchemaName, TableName, KeyColumns, IncludedColumns, NumberOfDuplicates, DuplicateIndexesList
+            }
+        }
+
+        if ($allDuplicateIndexes.Count -gt 0) {
+            Write-Log "[$ServerName] ALERTS: Duplicate indexes detected:" "ALERT"
+            foreach ($duplicate in $allDuplicateIndexes) {
+                $alertMessage = "Duplicate Index Alert: Database: $($duplicate.DatabaseName), Table: $($duplicate.SchemaName).$($duplicate.TableName), Keys: '$($duplicate.KeyColumns)', Includes: '$($duplicate.IncludedColumns)'. Duplicates found: $($duplicate.DuplicateIndexesList). Suggestion: Consider dropping one of the duplicate non-clustered indexes to improve write performance and storage efficiency. Verify usage (sys.dm_db_index_usage_stats) before dropping."
+                $script:alerts += "[$ServerName] " + $alertMessage
+                Write-Log "[$ServerName] " + $alertMessage "ALERT"
+                Insert-AlertToDB -ServerName $ServerName -AlertLevel "ALERT" -AlertCategory "Performance:DuplicateIndex" -Message $alertMessage
+                # Insert into DuplicateIndexes table
+                $insertQuery = "INSERT INTO [dbo].[DuplicateIndexes] (ServerName, DatabaseName, SchemaName, TableName, KeyColumns, IncludedColumns, NumberOfDuplicates, DuplicateIndexesList) VALUES (@ServerName, @DatabaseName, @SchemaName, @TableName, @KeyColumns, @IncludedColumns, @NumberOfDuplicates, @DuplicateIndexesList);"
+                Invoke-Sqlcmd -ServerInstance $Config.MonitoringDBServer -Database $Config.MonitoringDBName `
+                    -Query $insertQuery -TrustServerCertificate -ErrorAction SilentlyContinue `
+                    -Variable @(
+                        "ServerName=$ServerName",
+                        "DatabaseName=$($duplicate.DatabaseName)",
+                        "SchemaName=$($duplicate.SchemaName)",
+                        "TableName=$($duplicate.TableName)",
+                        "KeyColumns=$($duplicate.KeyColumns)",
+                        "IncludedColumns=$($duplicate.IncludedColumns)",
+                        "NumberOfDuplicates=$($duplicate.NumberOfDuplicates)",
+                        "DuplicateIndexesList=$($duplicate.DuplicateIndexesList)"
+                    ) | Out-Null
+            }
+        } else {
+            Write-Log "[$ServerName] INFO: No duplicate indexes found in user databases." "INFO"
+        }
+    } catch {
+        Write-Log "[$ServerName] ERROR: Failed to check for duplicate indexes. Error: $($_.Exception.Message)" "ERROR"
+        $script:alerts += "[$ServerName] Warning: Failed to check for duplicate indexes. Error: $($_.Exception.Message)"
+        Insert-AlertToDB -ServerName $ServerName -AlertLevel "ERROR" -AlertCategory "Performance:DuplicateIndex" -Message "Failed to check for duplicate indexes. Error: $($_.Exception.Message)"
+    }
+}
+
+# Function to analyze query resource utilization and provide suggestions
+function Analyze-QueryResourceUtilization {
+    param (
+        [string]$ServerName
+    )
+    $cpuQuery = @"
+    SELECT TOP 20
+        qs.creation_time,
+        qs.last_execution_time,
+        qs.execution_count,
+        (qs.total_worker_time / 1000000.0) AS total_cpu_s,
+        (qs.total_worker_time / (qs.execution_count * 1000000.0)) AS avg_cpu_s,
+        (qs.total_logical_reads / qs.execution_count) AS avg_logical_reads,
+        (qs.total_logical_writes / qs.execution_count) AS avg_logical_writes,
+        DB_NAME(t.dbid) AS DatabaseName,
+        t.text AS query_text,
+        qp.query_plan AS QueryPlanXML
+    FROM sys.dm_exec_query_stats qs
+    CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) t
+    CROSS APPLY sys.dm_exec_query_plan(qs.plan_handle) qp
+    WHERE t.dbid IS NOT NULL AND DB_NAME(t.dbid) NOT IN ('master', 'model', 'msdb', 'tempdb')
+    ORDER BY qs.total_worker_time DESC;
+"@
+
+    $ioQuery = @"
+    SELECT TOP 20
+        qs.creation_time,
+        qs.last_execution_time,
+        qs.execution_count,
+        qs.total_logical_reads,
+        (qs.total_logical_reads / qs.execution_count) AS avg_logical_reads,
+        (qs.total_logical_writes / qs.execution_count) AS avg_logical_writes,
+        (qs.total_worker_time / 1000000.0) AS total_cpu_s,
+        DB_NAME(t.dbid) AS DatabaseName,
+        t.text AS query_text,
+        qp.query_plan AS QueryPlanXML
+    FROM sys.dm_exec_query_stats qs
+    CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) t
+    CROSS APPLY sys.dm_exec_query_plan(qs.plan_handle) qp
+    WHERE t.dbid IS NOT NULL AND DB_NAME(t.dbid) NOT IN ('master', 'model', 'msdb', 'tempdb')
+    ORDER BY qs.total_logical_reads DESC;
+"@
+
+    $waitQuery = @"
+    SELECT TOP 20
+        r.session_id,
+        r.status,
+        r.command,
+        DB_NAME(r.database_id) AS DatabaseName,
+        r.wait_type,
+        r.wait_time AS WaitTimeMs,
+        r.last_wait_type,
+        r.blocking_session_id,
+        (SELECT text FROM sys.dm_exec_sql_text(r.sql_handle)) AS query_text,
+        (SELECT query_plan FROM sys.dm_exec_query_plan(r.plan_handle)) AS QueryPlanXML
+    FROM sys.dm_exec_requests r
+    WHERE r.session_id <> @@SPID
+    AND r.status IN ('running', 'suspended')
+    AND r.wait_type IS NOT NULL
+    ORDER BY r.wait_time DESC;
+"@
+
+    # 1. Top CPU Consuming Queries
+    try {
+        Write-Log "[$ServerName] Analyzing top CPU consuming queries..." "INFO"
+        $cpuQueries = Invoke-Sqlcmd -ServerInstance $ServerName -Database "master" -Query $cpuQuery -TrustServerCertificate -ErrorAction Stop -MaxCharLength 2147483647
+        if ($cpuQueries -and $cpuQueries.Count -gt 0) {
+            Write-Log "[$ServerName] Top 20 CPU Consuming Queries (Avg CPU > 0.05s):" "INFO"
+            foreach ($query in $cpuQueries) {
+                $queryPreview = ($query.query_text.Substring(0, [Math]::Min(100, $query.query_text.Length))).Replace("`r`n", " ").Replace("`n", " ")
+                $alertMessage = "High CPU Query (DB: $($query.DatabaseName)): Avg CPU: $($query.avg_cpu_s)s, Total CPU: $($query.total_cpu_s)s, Exec Count: $($query.execution_count). Query: $queryPreview.... Suggestion: Review execution plan, consider indexing or rewriting."
+                
+                # Insert into QueryPerformanceMetrics table
+                $insertQuery = "INSERT INTO [dbo].[QueryPerformanceMetrics] (ServerName, DatabaseName, QueryText, ExecutionCount, TotalCpuSeconds, AvgCpuSeconds, AvgLogicalReads, AvgLogicalWrites, QueryCategory, ExecutionPlanXML) VALUES (@ServerName, @DatabaseName, @QueryText, @ExecutionCount, @TotalCpuSeconds, @AvgCpuSeconds, @AvgLogicalReads, @AvgLogicalWrites, @QueryCategory, @ExecutionPlanXML);"
+                Invoke-Sqlcmd -ServerInstance $Config.MonitoringDBServer -Database $Config.MonitoringDBName `
+                    -Query $insertQuery -TrustServerCertificate -ErrorAction SilentlyContinue `
+                    -Variable @(
+                        "ServerName=$ServerName",
+                        "DatabaseName=$($query.DatabaseName)",
+                        "QueryText=$($query.query_text)",
+                        "ExecutionCount=$($query.execution_count)",
+                        "TotalCpuSeconds=$($query.total_cpu_s)",
+                        "AvgCpuSeconds=$($query.avg_cpu_s)",
+                        "AvgLogicalReads=$($query.avg_logical_reads)",
+                        "AvgLogicalWrites=$($query.avg_logical_writes)",
+                        "QueryCategory='CPU'",
+                        "ExecutionPlanXML=$($query.QueryPlanXML)"
+                    ) | Out-Null
+
+                if ($query.avg_cpu_s -gt 0.05) { # Threshold for alert
+                    $script:alerts += "[$ServerName] Performance Alert: " + $alertMessage
+                    Write-Log "[$ServerName] Performance Alert: " + $alertMessage "ALERT"
+                    Insert-AlertToDB -ServerName $ServerName -AlertLevel "ALERT" -AlertCategory "Performance:HighCPUQuery" -Message $alertMessage
+                } else {
+                    Write-Log "[$ServerName] INFO: CPU: $($query.avg_cpu_s)s, Reads: $($query.avg_logical_reads), Query: $queryPreview..." "INFO"
+                }
+            }
+        } else {
+            Write-Log "[$ServerName] INFO: No significant CPU consuming queries found." "INFO"
+        }
+    } catch {
+        Write-Log "[$ServerName] ERROR: Failed to analyze CPU queries. Error: $($_.Exception.Message)" "ERROR"
+        $script:alerts += "[$ServerName] Warning: Failed to analyze CPU queries. Error: $($_.Exception.Message)"
+        Insert-AlertToDB -ServerName $ServerName -AlertLevel "ERROR" -AlertCategory "Performance:QueryAnalysis" -Message "Failed to analyze CPU queries. Error: $($_.Exception.Message)"
+    }
+
+    # 2. Top I/O Consuming Queries
+    try {
+        Write-Log "[$ServerName] Analyzing top I/O consuming queries..." "INFO"
+        $ioQueries = Invoke-Sqlcmd -ServerInstance $ServerName -Database "master" -Query $ioQuery -TrustServerCertificate -ErrorAction Stop -MaxCharLength 2147483647
+        if ($ioQueries -and $ioQueries.Count -gt 0) {
+            Write-Log "[$ServerName] Top 20 I/O Consuming Queries (Avg Logical Reads > 1000):" "INFO"
+            foreach ($query in $ioQueries) {
+                $queryPreview = ($query.query_text.Substring(0, [Math]::Min(100, $query.query_text.Length))).Replace("`r`n", " ").Replace("`n", " ")
+                $alertMessage = "High I/O Query (DB: $($query.DatabaseName)): Avg Logical Reads: $($query.avg_logical_reads), Avg Logical Writes: $($query.avg_logical_writes), Exec Count: $($query.execution_count). Query: $queryPreview.... Suggestion: Optimize for I/O, check for missing indexes, or consider covering indexes."
+
+                # Insert into QueryPerformanceMetrics table
+                $insertQuery = "INSERT INTO [dbo].[QueryPerformanceMetrics] (ServerName, DatabaseName, QueryText, ExecutionCount, TotalCpuSeconds, AvgCpuSeconds, AvgLogicalReads, AvgLogicalWrites, QueryCategory, ExecutionPlanXML) VALUES (@ServerName, @DatabaseName, @QueryText, @ExecutionCount, @TotalCpuSeconds, @AvgCpuSeconds, @AvgLogicalReads, @AvgLogicalWrites, @QueryCategory, @ExecutionPlanXML);"
+                Invoke-Sqlcmd -ServerInstance $Config.MonitoringDBServer -Database $Config.MonitoringDBName `
+                    -Query $insertQuery -TrustServerCertificate -ErrorAction SilentlyContinue `
+                    -Variable @(
+                        "ServerName=$ServerName",
+                        "DatabaseName=$($query.DatabaseName)",
+                        "QueryText=$($query.query_text)",
+                        "ExecutionCount=$($query.execution_count)",
+                        "TotalCpuSeconds=$($query.total_cpu_s)",
+                        "AvgCpuSeconds=$($query.avg_cpu_s)",
+                        "AvgLogicalReads=$($query.avg_logical_reads)",
+                        "AvgLogicalWrites=$($query.avg_logical_writes)",
+                        "QueryCategory='IO'",
+                        "ExecutionPlanXML=$($query.QueryPlanXML)"
+                    ) | Out-Null
+
+                if ($query.avg_logical_reads -gt 1000) { # Threshold for alert
+                    $script:alerts += "[$ServerName] Performance Alert: " + $alertMessage
+                    Write-Log "[$ServerName] Performance Alert: " + $alertMessage "ALERT"
+                    Insert-AlertToDB -ServerName $ServerName -AlertLevel "ALERT" -AlertCategory "Performance:HighIOQuery" -Message $alertMessage
+                } else {
+                    Write-Log "[$ServerName] INFO: I/O: Reads: $($query.avg_logical_reads), Writes: $($query.avg_logical_writes), Query: $queryPreview..." "INFO"
+                }
+            }
+        } else {
+            Write-Log "[$ServerName] INFO: No significant I/O consuming queries found." "INFO"
+        }
+    } catch {
+        Write-Log "[$ServerName] ERROR: Failed to analyze I/O queries. Error: $($_.Exception.Message)" "ERROR"
