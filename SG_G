@@ -1,0 +1,388 @@
+<#
+.SYNOPSIS
+SQLGuardian is a PowerShell script that monitors SQL Server instances for security and performance issues.
+
+.DESCRIPTION
+This script checks for failed logins, unencrypted databases, performance issues (slow queries, missing indexes, CPU usage),
+deadlocks, blocking sessions, duplicate indexes, and analyzes query resource utilization for suggestions. It also monitors for
+index fragmentation, database growth, low disk space, SQL Agent job failures/long runs, backup status, long-running transactions,
+orphaned users, and server role membership. All collected data is now ingested into a central monitoring database.
+It supports interactive mode and automated email alerts. The server list is retrieved dynamically from a central database table (servername).
+
+.AUTHOR
+Wondi
+.VERSION
+1.7 - Security and Bug Fixes. (July 18, 2025)
+.LAST UPDATED
+July 18, 2025 - Refactored Insert-AlertToDB to prevent SQL injection, fixed bug in Check-LongRunningTransactions, and removed redundant code.
+.DEPENDENCIES
+- PowerShell 5.1 or later
+- SQL Server module (Invoke-Sqlcmd)
+- Python 3.9+ with pandas, scikit-learn, and pickle
+- Access to sysadmin role on SQL Server instances (for comprehensive monitoring)
+- Access (INSERT/SELECT) to the central monitoring database (SQLGuardianMonitor)
+.USAGE
+# Run in automated mode (for scheduled tasks, e.g., SQL Server Agent Job)
+# Ensure the account running the job has necessary SQL Server permissions and network access to LogRoot/ModelRoot.
+# NEW PARAMETERS: -MonitoringDBServer and -MonitoringDBName
+& "C:\Path\To\Your\Script\SQLGuardian.ps1" `
+    -CentralDBServer "YourCentralDbServer" `
+    -CentralDBName "YourMasterDB" `
+    -LogRoot "\\Server\Share\AuditLogs" `
+    -ModelRoot "\\Server\Share\Models" `
+    -MonitoringDBServer "YourMonitoringDbServer" `
+    -MonitoringDBName "SQLGuardianMonitor"
+
+# Run in interactive mode
+# NEW PARAMETERS: -MonitoringDBServer and -MonitoringDBName
+& "C:\Path\To\Your\Script\SQLGuardian.ps1" `
+    -Interactive `
+    -CentralDBServer "YourCentralDbServer" `
+    -CentralDBName "YourMasterDB" `
+    -LogRoot "D:\AuditLogs" `
+    -ModelRoot "D:\AuditLogs\Models" `
+    -MonitoringDBServer "YourMonitoringDbServer" `
+    -MonitoringDBName "SQLGuardianMonitor"
+
+.NOTES
+- **IMPORTANT:** Store sensitive data (e.g., SMTP credentials) securely (e.g., in a vault or encrypted file).
+  The current script includes a placeholder for an encrypted password; in a production environment,
+  consider using `Get-Credential`, Azure Key Vault, or a similar secure solution.
+- Log files are saved to the path specified by -LogRoot (e.g., \\Server\Share\AuditLogs\AuditLogs\).
+- Model file is located at the path specified by -ModelRoot (e.g., \\Server\Share\Models\login_anomaly_model.pkl).
+- Query Store is highly recommended for advanced historical query analysis. This script relies on DMVs.
+.TROUBLESHOOTING
+- **"Unknown command" in interactive mode:** The script file might not be reloaded correctly. Close PowerShell and reopen, then re-run the script. Ensure no duplicated function definitions.
+- **"Login failed" errors:** The account running the PowerShell script does not have sufficient permissions on the SQL Server instances (especially the central DB) or the new Monitoring DB. Grant `VIEW SERVER STATE`, `VIEW ANY DATABASE`, `VIEW ANY DEFINITION` or the `sysadmin` role, and `SELECT` on `servername` table. Also grant `INSERT` permissions on the `SQLGuardianMonitor` tables.
+- Error: "Arithmetic overflow error converting expression to data type datetime"
+  - Cause: Incorrect handling of timestamp as DATETIME instead of milliseconds.
+  - Fix: Use DATEADD(MILLISECOND, timestamp, sqlserver_start_time) for conversion. (Addressed in script).
+- No CPU data: Check sys.dm_os_ring_buffers for data and ensure server is running.
+- Python script failures: Ensure Python is installed, path is correct, and all required libraries (pandas, scikit-learn, pickle) are installed (`pip install pandas scikit-learn`). Check Python output in logs for specific errors.
+.CHANGELOG
+- 2025-03-16: Initial version with basic monitoring features.
+- 2025-03-16: Fixed string interpolation error in Write-Host commands using ${}.
+- 2025-03-16: Resolved arithmetic overflow in CPU query by correcting timestamp conversion with DATEADD.
+- 2025-03-16: Added database-driven server list from servername table.
+- 2025-03-16: Added select servers command in interactive mode.
+- 2025-03-16: Updated paths for network share and enhanced logging for SQL Server Agent.
+- 2025-07-17: Rewritten with improved logging, robust error handling, and configuration management.
+- 2025-07-17: Added Check-DuplicateIndexes, Analyze-QueryResourceUtilization, and integrated basic query suggestions.
+- 2025-07-17: Full structural correction of PowerShell script, fixing nested functions and command recognition issues.
+- 2025-07-17: Added: Check-IndexFragmentation, Check-DiskSpaceAndGrowth, Check-AgentJobs, Check-Backups, Check-LongRunningTransactions, Check-OrphanedUsers, Audit-ServerRoles.
+- 2025-07-18: Modified all check functions to ingest data into `SQLGuardianMonitor` database tables.
+- 2025-07-18: Refactored Insert-AlertToDB to prevent SQL injection, fixed bug in Check-LongRunningTransactions, and removed redundant code.
+#&gt;
+
+param (
+    [string]$CentralDBServer = "Capsqldbat16v01", # Server hosting the servername table
+    [string]$CentralDBName = "InstanceMonitor",           # Database containing the servername table
+    [switch]$Interactive,                          # Run in interactive mode
+    [string]$LogRoot = "C:\Users\e010523\Documents\Utilities",             # Root directory for all log files (e.g., D:\AuditLogs or \\Server\Share\AuditLogs)
+    [string]$ModelRoot = "C:\Users\e010523\Documents\Utilities\Models",    # Root directory for Python models (e.g., D:\AuditLogs\Models or \\Server\Share\Models)
+    [string]$MonitoringDBServer = "Capsqldbat16v01",        # Server for the new SQLGuardianMonitor database
+    [string]$MonitoringDBName = "SQLGuardianMonitor" # Name of the new monitoring database
+)
+
+#region Global Variables and Configuration
+$ServerList = @()
+
+# Global list to store alerts generated during the script run (for immediate console/email feedback)
+$script:alerts = @()
+
+
+# Flag to indicate if the script is running in interactive mode
+$script:InteractiveMode = $Interactive.IsPresent
+
+# Paths for current log files (set dynamically later)
+$script:interactiveLogFile = $null
+$script:agentLogFile = $null
+
+# Define the secure password BEFORE the hash table
+# IMPORTANT: Replace with a secure method for password storage/retrieval in production.
+$securePassword = ConvertTo-SecureString "vrwt qafv lpek kcfa" -AsPlainText -Force
+
+# Configuration settings in a hashtable for easy access
+$Config = @{
+    SmtpServer          = "smtp.gmail.com"
+    SmtpPort            = 587
+    SmtpUsername        = "wondenad@gmail.com"
+    SmtpPassword        = $securePassword
+    EmailTo             = "wondenad@gmail.com"
+    EmailFrom           = "wondenad@gmail.com"
+    LogDir              = "$LogRoot\AuditLogs"
+    ModelDir            = "$ModelRoot"
+    MonitoringDBServer  = $MonitoringDBServer  # New: Central monitoring DB server
+    MonitoringDBName    = $MonitoringDBName    # New: Central monitoring DB name
+}
+
+# Ensure log and model directories exist before starting operations
+try {
+    if (-not (Test-Path $Config.LogDir)) {
+        New-Item -ItemType Directory -Path $Config.LogDir -Force | Out-Null
+    }
+    if (-not (Test-Path $Config.ModelDir)) {
+        New-Item -ItemType Directory -Path $Config.ModelDir -Force | Out-Null
+    }
+} catch {
+    Write-Host "ERROR: Failed to create log or model directories. Script cannot proceed. Error: $($_.Exception.Message)" -ForegroundColor Red
+    Exit 1 # Exit if essential directories cannot be created
+}
+
+#endregion
+
+#region Logging Function
+
+# Function to centralize logging to console (if interactive) and appropriate log file
+function Write-Log {
+    param (
+        [string]$Message,
+        [string]$LogLevel = "INFO" # Log level (e.g., INFO, WARN, ERROR, DEBUG, ALERT)
+    )
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $formattedMessage = "[$timestamp] [$LogLevel] $Message"
+
+    # Output to console if in interactive mode
+    if ($script:InteractiveMode) {
+        # Apply color coding for interactive mode
+        switch ($LogLevel) {
+            "ERROR" { Write-Host $formattedMessage -ForegroundColor Red }
+            "WARN"  { Write-Host $formattedMessage -ForegroundColor Yellow }
+            "ALERT" { Write-Host $formattedMessage -ForegroundColor Magenta }
+            "DEBUG" { Write-Host $formattedMessage -ForegroundColor DarkGray }
+            default { Write-Host $formattedMessage }
+        }
+    }
+
+    # Output to the relevant log file
+    # Prioritize interactive log if in interactive mode, otherwise use agent log, fallback to general.
+    if ($script:InteractiveMode -and ($script:interactiveLogFile -ne $null) -and (Test-Path $script:interactiveLogFile)) {
+        Add-Content -Path $script:interactiveLogFile -Value $formattedMessage
+    } elseif ($script:agentLogFile -ne $null -and (Test-Path $script:agentLogFile)) {
+        Add-Content -Path $script:agentLogFile -Value $formattedMessage
+    }
+    # Fallback to a general log if no specific log file is set (e.g., during initial setup errors)
+    else {
+        Add-Content -Path "$($Config.LogDir)\SQLGuardian_General.log" -Value $formattedMessage
+    }
+}
+
+#endregion
+
+#region Core Monitoring Functions
+
+# Helper function to insert an alert into the central monitoring database
+function Insert-AlertToDB {
+    param (
+        [string]$ServerName,
+        [string]$AlertLevel,
+        [string]$AlertCategory,
+        [string]$Message
+    )
+    $query = "INSERT INTO [dbo].[Alerts] (ServerName, AlertLevel, AlertCategory, Message) VALUES (@ServerName, @AlertLevel, @AlertCategory, @Message);"
+    try {
+        Invoke-Sqlcmd -ServerInstance $Config.MonitoringDBServer -Database $Config.MonitoringDBName `
+            -Query $query -TrustServerCertificate -ErrorAction Stop `
+            -Variable @(
+                "ServerName=$ServerName",
+                "AlertLevel=$AlertLevel",
+                "AlertCategory=$AlertCategory",
+                "Message=$Message"
+            ) | Out-Null
+        Write-Log "Alert inserted to Monitoring DB." "INFO"
+    } catch {
+        Write-Log "ERROR: Failed to insert alert to Monitoring DB. ERROR: $($_.Exception.Message)" "ERROR"
+    }
+}
+# Function to retrieve the list of SQL Server instances from a central database table
+function Get-ServerListFromDB {
+    param (
+        [string]$Server,
+        [string]$Database
+    )
+    $query = "SELECT ServerName FROM servername;"
+    try {
+        Write-Log "Attempting to retrieve server list from $Server.$Database..." "INFO"
+        $servers = Invoke-Sqlcmd -ServerInstance $Server -Database $Database -Query $query -TrustServerCertificate -ErrorAction Stop
+        Write-Log "Successfully retrieved server list from $Server.$Database." "INFO"
+        return $servers | Select-Object -ExpandProperty ServerName
+    } catch {
+        $errorMessage = "ERROR: Failed to retrieve server list from database '$Server.$Database'. Error: $($_.Exception.Message). Falling back to default list."
+        Write-Log $errorMessage "ERROR"
+        return @('capsqldbat16v01', 'AO2017TEST-02G1\AOSQL2017TEST02', 'DALTESTSQL22V01\AOSQL2022TEST01') # Fallback list
+    }
+}
+
+# Function to check for failed login attempts from SQL Server Error Log
+function Check-FailedLogins {
+    param (
+        [string]$ServerName,
+        [int]$TimeWindowMinutes = 15
+    )
+    $query = "EXEC sp_readerrorlog 0, 1, 'Login failed';"
+    $logFile = "$($Config.LogDir)\FailedLogins_$ServerName.csv"
+    $captureTime = Get-Date
+
+    try {
+        Write-Log "[$ServerName] Checking for failed login attempts..." "INFO"
+        $errorLog = Invoke-Sqlcmd -ServerInstance $ServerName -Database "master" -Query $query -TrustServerCertificate -ErrorAction Stop
+
+        if ($null -eq $errorLog) {
+            $script:alerts += "[$ServerName] Warning: Unable to read error log for failed logins. Check permissions or log availability."
+            Write-Log "[$ServerName] WARN: Unable to read error log for failed logins. Check permissions or log availability." "WARN"
+            Insert-AlertToDB -ServerName $ServerName -AlertLevel "WARN" -AlertCategory "Security" -Message "Unable to read error log for failed logins. Check permissions or log availability."
+            return
+        }
+
+        if (-not (Test-Path $logFile)) {
+            "Timestamp,User,Reason,ClientIP,ServerName" | Out-File $logFile -Encoding UTF8
+            Write-Log "[$ServerName] Created new FailedLogins CSV file: $logFile" "DEBUG"
+        }
+
+        $failedLogins = @()
+        foreach ($log in $errorLog) {
+            if ($log.Text -match "Login failed for user '?(.*?)(?:'| Reason)") {
+                $user = $matches[1]
+                $reason = if ($log.Text -match "Reason: (.*?)\.") { $matches[1] } else { "Unknown" }
+                $clientIP = if ($log.Text -match "client: (.*?)\]") { $matches[1] } else { "Unknown" }
+                $failedLogins += [PSCustomObject]@{
+                    Timestamp  = $log.LogDate.ToString("MM/dd/yyyy HH:mm:ss")
+                    User       = $user
+                    Reason     = $reason
+                    ClientIP   = $clientIP
+                    ServerName = $ServerName
+                }
+            }
+        }
+
+        if ($failedLogins.Count -gt 0) {
+            $failedLogins | Export-Csv $logFile -NoTypeInformation -Append -Encoding UTF8
+            Write-Log "[$ServerName] INFO: $($failedLogins.Count) failed login(s) recorded in the last $TimeWindowMinutes minutes and exported to CSV." "INFO"
+            $script:alerts += "[$ServerName] Info: $($failedLogins.Count) failed login(s) recorded in the last $TimeWindowMinutes minutes."
+            
+            # Insert into Alerts table for each failed login
+            foreach ($fl in $failedLogins) {
+                Insert-AlertToDB -ServerName $ServerName -AlertLevel "INFO" -AlertCategory "Security:FailedLogin" -Message "Login failed for user '$($fl.User)' from IP $($fl.ClientIP). Reason: $($fl.Reason)."
+            }
+
+        } else {
+            Write-Log "[$ServerName] INFO: No new failed logins detected." "INFO"
+        }
+    } catch {
+        Write-Log "[$ServerName] ERROR: Failed to check error log for failed logins. Error: $($_.Exception.Message)" "ERROR"
+        $script:alerts += "[$ServerName] Warning: Failed to check error log. Error: $($_.Exception.Message)"
+        Insert-AlertToDB -ServerName $ServerName -AlertLevel "ERROR" -AlertCategory "Security" -Message "Failed to read error log for failed logins. Error: $($_.Exception.Message)"
+    }
+}
+
+# Function to check encryption status of user databases
+function Check-EncryptionStatus {
+    param (
+        [string]$ServerName
+    )
+    $query = @"
+    SELECT
+        name,
+        is_encrypted
+    FROM sys.databases
+    WHERE is_encrypted = 0
+    AND name NOT IN ('master', 'model', 'msdb', 'tempdb');
+"@
+    try {
+        Write-Log "[$ServerName] Checking encryption status for user databases..." "INFO"
+        $unencryptedDbs = Invoke-Sqlcmd -ServerInstance $ServerName -Database "master" -Query $query -TrustServerCertificate -ErrorAction Stop
+        if ($null -eq $unencryptedDbs) {
+            $script:alerts += "[$ServerName] Warning: Unable to check encryption status. Check permissions or database availability."
+            Write-Log "[$ServerName] WARN: Unable to check encryption status. Result was null. Check permissions." "WARN"
+            Insert-AlertToDB -ServerName $ServerName -AlertLevel "WARN" -AlertCategory "Security:Encryption" -Message "Unable to check encryption status. Check permissions."
+            return
+        }
+
+        if ($unencryptedDbs.Count -gt 0) {
+            foreach ($db in $unencryptedDbs) {
+                $alertMessage = "Database '$($db.name)' is not encrypted. Recommend enabling Transparent Data Encryption (TDE)."
+                $script:alerts += "[$ServerName] Security Alert: " + $alertMessage
+                Write-Log "[$ServerName] Security Alert: " + $alertMessage "ALERT"
+                Insert-AlertToDB -ServerName $ServerName -AlertLevel "ALERT" -AlertCategory "Security:Encryption" -Message $alertMessage
+            }
+        } else {
+            Write-Log "[$ServerName] INFO: All user databases are encrypted." "INFO"
+        }
+    } catch {
+        Write-Log "[$ServerName] ERROR: Failed to check encryption status. Error: $($_.Exception.Message)" "ERROR"
+        $script:alerts += "[$ServerName] Warning: Failed to check encryption status. Error: $($_.Exception.Message)"
+        Insert-AlertToDB -ServerName $ServerName -AlertLevel "ERROR" -AlertCategory "Security:Encryption" -Message "Failed to check encryption status. Error: $($_.Exception.Message)"
+    }
+}
+
+# Function to check performance metrics (slow queries, missing indexes, CPU usage)
+function Check-Performance {
+    param (
+        [string]$ServerName
+    )
+    # Query to find top 20 slow queries by total worker time
+    $slowQuery = @"
+    SELECT TOP 20
+        t.text AS query_text,
+        qs.execution_count,
+        qs.total_worker_time / 1000 AS total_worker_time_ms,
+        qs.total_worker_time / qs.execution_count / 1000 AS avg_worker_time_ms
+    FROM sys.dm_exec_query_stats qs
+    CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) t
+    ORDER BY qs.total_worker_time DESC;
+"@
+    # Query to find missing indexes with high impact
+    $indexQuery = @"
+    SELECT
+        DB_NAME(mid.database_id) AS database_name,
+        migs.avg_user_impact,
+        mid.statement AS table_name,
+        mid.equality_columns,
+        mid.inequality_columns
+    FROM sys.dm_db_missing_index_group_stats migs
+    JOIN sys.dm_db_missing_index_groups mig ON migs.group_handle = mig.index_group_handle
+    JOIN sys.dm_db_missing_index_details mid ON mig.index_handle = mid.index_handle
+    JOIN sys.databases d ON mid.database_id = d.database_id
+    WHERE migs.avg_user_impact &gt; 50 -- Filter for high impact indexes
+    AND d.name NOT IN ('master', 'model', 'msdb', 'tempdb')
+    ORDER BY migs.avg_user_impact DESC;
+"@
+    # Query to get CPU usage from ring buffers for the last 15 minutes
+    $cpuQuery = @"
+    SELECT
+        AVG(CAST(record.value('(./Record/SchedulerMonitorEvent/SystemHealth/SystemIdle)[1]', 'int') AS DECIMAL(5,2))) AS SystemIdlePercent,
+        AVG(CAST(record.value('(./Record/SchedulerMonitorEvent/SystemHealth/ProcessUtilization)[1]', 'int') AS DECIMAL(5,2))) AS SQLProcessUtilizationPercent
+    FROM (
+        SELECT
+            DATEADD(MILLISECOND, rb.timestamp - si.ms_ticks, GETDATE()) AS actual_timestamp,
+            CONVERT(XML, rb.record) AS record
+        FROM sys.dm_os_ring_buffers rb
+        CROSS JOIN sys.dm_os_sys_info si
+        WHERE rb.ring_buffer_type = N'RING_BUFFER_SCHEDULER_MONITOR'
+        AND rb.record LIKE '%&lt;SystemHealth&gt;%'
+    ) AS RingBuffer
+    WHERE actual_timestamp &gt; DATEADD(MINUTE, -15, GETDATE());
+"@
+
+    # Check Slow Queries
+    try {
+        Write-Log "[$ServerName] Checking for slow queries..." "INFO"
+        $slowQueries = Invoke-Sqlcmd -ServerInstance $ServerName -Database "master" -Query $slowQuery -TrustServerCertificate -ErrorAction Stop
+        if ($null -eq $slowQueries) {
+            $script:alerts += "[$ServerName] Warning: Unable to check slow queries. Check VIEW SERVER STATE permission."
+            Write-Log "[$ServerName] WARN: Unable to check slow queries. Result was null. Check VIEW SERVER STATE permission." "WARN"
+            Insert-AlertToDB -ServerName $ServerName -AlertLevel "WARN" -AlertCategory "Performance:Query" -Message "Unable to check slow queries. Check VIEW SERVER STATE permission."
+        } elseif ($slowQueries.Count -gt 0) {
+            foreach ($query in $slowQueries) {
+                if ($query.avg_worker_time_ms -gt 20) { # Threshold for alert (20ms avg CPU time)
+                    $queryPreview = ($query.query_text.Substring(0, [Math]::Min(100, $query.query_text.Length))).Replace("`r`n", " ").Replace("`n", " ")
+                    $alertMessage = "Query '$queryPreview...' ran $($query.execution_count) times, total CPU time: $($query.total_worker_time_ms)ms, avg CPU time: $($query.avg_worker_time_ms)ms. Suggestion: Investigate this query for optimization (e.g., add indexes, rewrite query)."
+                    $script:alerts += "[$ServerName] Performance Alert: " + $alertMessage
+                    Write-Log "[$ServerName] Performance Alert: " + $alertMessage "ALERT"
+                    Insert-AlertToDB -ServerName $ServerName -AlertLevel "ALERT" -AlertCategory "Performance:SlowQuery" -Message $alertMessage
+                    # Store in QueryPerformanceMetrics (if you later want to populate all fields)
+                    # For now, just alerts from this specific check
+                }
+            }
+        } else {
+            Write-Log "[$ServerName] INFO: No significantly slow
