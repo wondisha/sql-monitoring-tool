@@ -1,0 +1,367 @@
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+
+-- Error logging table creation (idempotent)
+IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE name = 'SQLBestPracticeMonitoringErrors')
+BEGIN
+    CREATE TABLE SQLBestPracticeMonitoringErrors (
+        InstanceID INT,
+        DBID INT,
+        DatabaseName SYSNAME,
+        BestPracticeName NVARCHAR(100),
+        ErrorMessage NVARCHAR(MAX),
+        ErrorLine INT,
+        LogTime DATETIME
+    );
+END
+GO
+
+-- Main monitoring table creation (idempotent)
+IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE name = 'SQLBestPracticeMonitoring')
+BEGIN
+    CREATE TABLE SQLBestPracticeMonitoring (
+        ID INT IDENTITY(1,1) PRIMARY KEY,
+        InstanceID INT,
+        DBID INT,
+        InstanceName NVARCHAR(100),
+        DatabaseName SYSNAME,
+        BestPracticeName NVARCHAR(100),
+        CurrentValue NVARCHAR(MAX),
+        RecommendedValue NVARCHAR(MAX),
+        Status NVARCHAR(50) DEFAULT 'Unresolved', -- 'Unresolved', 'Resolved'
+        Notes NVARCHAR(MAX),
+        LastChecked DATETIME DEFAULT GETDATE(),
+        ResolvedDate DATETIME NULL
+    );
+END
+GO
+
+ALTER PROCEDURE [dbo].[usp_CheckSQLBestPractices]
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    -- Debug log table
+    DECLARE @DebugLog TABLE (LogMessage NVARCHAR(MAX), LogTime DATETIME);
+
+    -- Instance-level variables
+    DECLARE @InstanceID INT, @InstanceName NVARCHAR(100);
+    DECLARE @RecommendedMaxDOP INT, @LogicalProcessorsPerNUMA INT, @NUMANodeCount INT, @TotalLogicalProcessors INT, @CurrentMaxDOP INT;
+    DECLARE @CurrentCostThreshold INT, @RecommendedCostThreshold INT = 25;
+    DECLARE @MaxServerMemory BIGINT, @MinServerMemory BIGINT, @TotalPhysicalMemory BIGINT;
+    DECLARE @TempdbFileCount INT, @TempdbRecommendedFiles INT;
+    DECLARE @LatestCompatLevel INT, @ProductMajorVersion INT;
+    DECLARE @IFIEnabled BIT = 0;
+    DECLARE @LPIMEnabled BIT = 0;
+    DECLARE @DefaultTraceEnabled BIT = 0;
+
+    DECLARE @DBID INT, @DBName NVARCHAR(128);
+
+    -- Log start of execution
+    INSERT INTO @DebugLog (LogMessage, LogTime) VALUES ('Starting SQL Best Practices Check', GETDATE());
+
+    -- Get general server info
+    SELECT @ProductMajorVersion = CAST(SERVERPROPERTY('ProductMajorVersion') AS INT);
+    SELECT @TotalLogicalProcessors = cpu_count FROM sys.dm_os_sys_info;
+    SELECT @TotalPhysicalMemory = total_physical_memory_kb / 1024 FROM sys.dm_os_sys_memory;
+
+    -- Calculate recommended MaxDOP
+    SELECT @NUMANodeCount = COUNT(DISTINCT node_id)
+    FROM sys.dm_os_nodes
+    WHERE node_state_desc = 'ONLINE' AND node_id < 64;
+
+    SET @LogicalProcessorsPerNUMA = CASE WHEN @NUMANodeCount > 0 THEN @TotalLogicalProcessors / @NUMANodeCount ELSE @TotalLogicalProcessors END;
+    SET @RecommendedMaxDOP = CASE
+        WHEN @TotalLogicalProcessors <= 8 THEN @TotalLogicalProcessors
+        WHEN @LogicalProcessorsPerNUMA <= 8 THEN @LogicalProcessorsPerNUMA
+        ELSE 8
+    END;
+
+    -- Get current instance-level settings
+    SELECT
+        @CurrentMaxDOP = ISNULL(CAST(MAXDOP.value_in_use AS INT), 0),
+        @CurrentCostThreshold = ISNULL(CAST(CTP.value_in_use AS INT), 0),
+        @MaxServerMemory = ISNULL(CAST(MAXMEM.value_in_use AS BIGINT), 2147483647),
+        @MinServerMemory = ISNULL(CAST(MINMEM.value_in_use AS BIGINT), 0)
+    FROM sys.configurations AS MAXDOP
+    LEFT JOIN sys.configurations AS CTP ON CTP.name = 'cost threshold for parallelism'
+    LEFT JOIN sys.configurations AS MAXMEM ON MAXMEM.name = 'max server memory (MB)'
+    LEFT JOIN sys.configurations AS MINMEM ON MINMEM.name = 'min server memory (MB)'
+    WHERE MAXDOP.name = 'max degree of parallelism';
+
+    -- Get Tempdb file count
+    SELECT @TempdbFileCount = COUNT(*) FROM sys.master_files WHERE database_id = DB_ID('tempdb') AND type = 0;
+    SET @TempdbRecommendedFiles = CASE WHEN @TotalLogicalProcessors <= 8 THEN @TotalLogicalProcessors ELSE 8 END;
+
+    -- Get the latest compatibility level
+    SET @LatestCompatLevel =
+        CASE
+            WHEN @ProductMajorVersion = 16 THEN 160
+            WHEN @ProductMajorVersion = 15 THEN 150
+            WHEN @ProductMajorVersion = 14 THEN 140
+            WHEN @ProductMajorVersion = 13 THEN 130
+            ELSE 120
+        END;
+
+    -- Check for Instant File Initialization (IFI)
+    EXEC xp_instance_regread N'HKEY_LOCAL_MACHINE', N'SOFTWARE\Microsoft\Microsoft SQL Server\MSSQLServer\Setup', N'SQLDataRoot', @IFIEnabled OUTPUT;
+
+    -- Check for Lock Pages in Memory (LPIM)
+    EXEC xp_instance_regread N'HKEY_LOCAL_MACHINE', N'SOFTWARE\Microsoft\Microsoft SQL Server\MSSQLServer\Setup', N'SQLServer2005LockMemory', @LPIMEnabled OUTPUT;
+
+    -- Check for Default Trace
+    SELECT @DefaultTraceEnabled = CAST(value_in_use AS BIT)
+    FROM sys.configurations
+    WHERE name = 'default trace enabled';
+
+    -- Instance Cursor
+    DECLARE instance_cursor CURSOR LOCAL FAST_FORWARD FOR
+    SELECT InstanceID, Instance FROM Instances;
+
+    OPEN instance_cursor;
+    FETCH NEXT FROM instance_cursor INTO @InstanceID, @InstanceName;
+
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        BEGIN TRY
+            -- MaxDOP Check
+            MERGE INTO SQLBestPracticeMonitoring AS Target
+            USING (SELECT 1 AS Source) AS Source
+            ON (Target.InstanceID = @InstanceID AND Target.DBID = 0 AND Target.BestPracticeName = 'MaxDOP' AND Target.Status = 'Unresolved' AND @CurrentMaxDOP = @RecommendedMaxDOP)
+            WHEN MATCHED THEN
+                UPDATE SET Status = 'Resolved', CurrentValue = CAST(@CurrentMaxDOP AS NVARCHAR(255)), Notes = 'MaxDOP is set as recommended.', ResolvedDate = GETDATE(), LastChecked = GETDATE()
+            WHEN NOT MATCHED BY TARGET AND @CurrentMaxDOP != @RecommendedMaxDOP THEN
+                INSERT (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+                VALUES (@InstanceID, 0, @InstanceName, 'InstanceLevel', 'MaxDOP', CAST(@CurrentMaxDOP AS NVARCHAR(255)), CAST(@RecommendedMaxDOP AS NVARCHAR(255)), 'Unresolved', 'MaxDOP should be set to ' + CAST(@RecommendedMaxDOP AS NVARCHAR(10)) + ' based on server configuration.');
+
+            -- Cost Threshold for Parallelism Check
+            MERGE INTO SQLBestPracticeMonitoring AS Target
+            USING (SELECT 1 AS Source) AS Source
+            ON (Target.InstanceID = @InstanceID AND Target.DBID = 0 AND Target.BestPracticeName = 'CostThresholdParallelism' AND Target.Status = 'Unresolved' AND @CurrentCostThreshold >= @RecommendedCostThreshold)
+            WHEN MATCHED THEN
+                UPDATE SET Status = 'Resolved', CurrentValue = CAST(@CurrentCostThreshold AS NVARCHAR(255)), Notes = 'Cost threshold for parallelism is appropriately configured.', ResolvedDate = GETDATE(), LastChecked = GETDATE()
+            WHEN NOT MATCHED BY TARGET AND @CurrentCostThreshold < @RecommendedCostThreshold THEN
+                INSERT (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+                VALUES (@InstanceID, 0, @InstanceName, 'InstanceLevel', 'CostThresholdParallelism', CAST(@CurrentCostThreshold AS NVARCHAR(255)), CAST(@RecommendedCostThreshold AS NVARCHAR(255)), 'Unresolved', 'Cost threshold for parallelism should be at least ' + CAST(@RecommendedCostThreshold AS NVARCHAR(10)) + ' for better performance.');
+
+            -- Max Server Memory Check
+            DECLARE @RecommendedMaxMemory BIGINT = CAST(@TotalPhysicalMemory * 0.8 AS INT);
+            MERGE INTO SQLBestPracticeMonitoring AS Target
+            USING (SELECT 1 AS Source) AS Source
+            ON (Target.InstanceID = @InstanceID AND Target.DBID = 0 AND Target.BestPracticeName = 'MaxServerMemory' AND Target.Status = 'Unresolved' AND @MaxServerMemory != 2147483647 AND @MaxServerMemory < (@TotalPhysicalMemory * 0.9))
+            WHEN MATCHED THEN
+                UPDATE SET Status = 'Resolved', CurrentValue = CAST(@MaxServerMemory AS NVARCHAR(255)) + ' MB', Notes = 'Max server memory is properly configured.', ResolvedDate = GETDATE(), LastChecked = GETDATE()
+            WHEN NOT MATCHED BY TARGET AND (@MaxServerMemory = 2147483647 OR @MaxServerMemory >= (@TotalPhysicalMemory * 0.9)) THEN
+                INSERT (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+                VALUES (@InstanceID, 0, @InstanceName, 'InstanceLevel', 'MaxServerMemory',
+                   CASE WHEN @MaxServerMemory = 2147483647 THEN 'Unlimited (Default)' ELSE CAST(@MaxServerMemory AS NVARCHAR(255)) + ' MB' END,
+                   CAST(@RecommendedMaxMemory AS NVARCHAR(255)) + ' MB', 'Unresolved',
+                   'Max server memory should be configured to leave memory for OS. Recommended: ~' + CAST(@RecommendedMaxMemory AS NVARCHAR(10)) + ' MB');
+
+            -- Min Server Memory Check
+            MERGE INTO SQLBestPracticeMonitoring AS Target
+            USING (SELECT 1 AS Source) AS Source
+            ON (Target.InstanceID = @InstanceID AND Target.DBID = 0 AND Target.BestPracticeName = 'MinServerMemory' AND Target.Status = 'Unresolved' AND @MinServerMemory > 0)
+            WHEN MATCHED THEN
+                UPDATE SET Status = 'Resolved', CurrentValue = CAST(@MinServerMemory AS NVARCHAR(255)) + ' MB', Notes = 'Min server memory is appropriately configured.', ResolvedDate = GETDATE(), LastChecked = GETDATE()
+            WHEN NOT MATCHED BY TARGET AND @MinServerMemory = 0 THEN
+                INSERT INTO SQLBestPracticeMonitoring (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+                VALUES (@InstanceID, 0, @InstanceName, 'InstanceLevel', 'MinServerMemory', '0 MB', CAST(CAST(@MaxServerMemory * 0.25 AS INT) AS NVARCHAR(255)) + ' MB', 'Unresolved', 'Min server memory should be set to a non-zero value, e.g., 25% of Max, to prevent memory pressure.');
+
+            -- Tempdb Configuration Check
+            MERGE INTO SQLBestPracticeMonitoring AS Target
+            USING (SELECT 1 AS Source) AS Source
+            ON (Target.InstanceID = @InstanceID AND Target.DBID = 0 AND Target.BestPracticeName = 'TempdbFileCount' AND Target.Status = 'Unresolved' AND @TempdbFileCount = @TempdbRecommendedFiles)
+            WHEN MATCHED THEN
+                UPDATE SET Status = 'Resolved', CurrentValue = CAST(@TempdbFileCount AS NVARCHAR(255)) + ' files', Notes = 'Tempdb has optimal number of data files.', ResolvedDate = GETDATE(), LastChecked = GETDATE()
+            WHEN NOT MATCHED BY TARGET AND @TempdbFileCount != @TempdbRecommendedFiles THEN
+                INSERT (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+                VALUES (@InstanceID, 0, @InstanceName, 'InstanceLevel', 'TempdbFileCount', CAST(@TempdbFileCount AS NVARCHAR(255)) + ' files', CAST(@TempdbRecommendedFiles AS NVARCHAR(255)) + ' files', 'Unresolved', 'Tempdb should have ' + CAST(@TempdbRecommendedFiles AS NVARCHAR(10)) + ' data files (equal to logical processors, max 8) for optimal performance.');
+            
+            -- Instant File Initialization (IFI) Check
+            MERGE INTO SQLBestPracticeMonitoring AS Target
+            USING (SELECT 1 AS Source) AS Source
+            ON (Target.InstanceID = @InstanceID AND Target.DBID = 0 AND Target.BestPracticeName = 'InstantFileInitialization' AND Target.Status = 'Unresolved' AND @IFIEnabled = 1)
+            WHEN MATCHED THEN
+                UPDATE SET Status = 'Resolved', CurrentValue = 'Enabled', Notes = 'Instant File Initialization is enabled.', ResolvedDate = GETDATE(), LastChecked = GETDATE()
+            WHEN NOT MATCHED BY TARGET AND @IFIEnabled = 0 THEN
+                INSERT (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+                VALUES (@InstanceID, 0, @InstanceName, 'InstanceLevel', 'InstantFileInitialization', 'Disabled', 'Enabled', 'Unresolved', 'Instant File Initialization should be enabled for faster file growth and better performance.');
+            
+            -- Lock Pages in Memory (LPIM) Check
+            MERGE INTO SQLBestPracticeMonitoring AS Target
+            USING (SELECT 1 AS Source) AS Source
+            ON (Target.InstanceID = @InstanceID AND Target.DBID = 0 AND Target.BestPracticeName = 'LockPagesInMemory' AND Target.Status = 'Unresolved' AND @LPIMEnabled = 1)
+            WHEN MATCHED THEN
+                UPDATE SET Status = 'Resolved', CurrentValue = 'Enabled', Notes = 'Lock Pages in Memory is enabled.', ResolvedDate = GETDATE(), LastChecked = GETDATE()
+            WHEN NOT MATCHED BY TARGET AND @LPIMEnabled = 0 THEN
+                INSERT (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+                VALUES (@InstanceID, 0, @InstanceName, 'InstanceLevel', 'LockPagesInMemory', 'Disabled', 'Enabled', 'Unresolved', 'Lock Pages in Memory should be enabled for dedicated SQL Servers to prevent memory paging.');
+
+            -- Default Trace Check
+            MERGE INTO SQLBestPracticeMonitoring AS Target
+            USING (SELECT 1 AS Source) AS Source
+            ON (Target.InstanceID = @InstanceID AND Target.DBID = 0 AND Target.BestPracticeName = 'DefaultTrace' AND Target.Status = 'Unresolved' AND @DefaultTraceEnabled = 1)
+            WHEN MATCHED THEN
+                UPDATE SET Status = 'Resolved', CurrentValue = 'Enabled', Notes = 'Default Trace is enabled.', ResolvedDate = GETDATE(), LastChecked = GETDATE()
+            WHEN NOT MATCHED BY TARGET AND @DefaultTraceEnabled = 0 THEN
+                INSERT (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+                VALUES (@InstanceID, 0, @InstanceName, 'InstanceLevel', 'DefaultTrace', 'Disabled', 'Enabled', 'Unresolved', 'The default trace should be enabled to capture important instance events.');
+
+        END TRY
+        BEGIN CATCH
+            INSERT INTO SQLBestPracticeMonitoringErrors (
+                InstanceID, DBID, DatabaseName, BestPracticeName,
+                ErrorMessage, ErrorLine, LogTime
+            )
+            VALUES (
+                ISNULL(@InstanceID, -1),
+                0,
+                ISNULL(@InstanceName, 'Unknown'),
+                'InstanceLevel',
+                ERROR_MESSAGE(),
+                ERROR_LINE(),
+                GETDATE()
+            );
+
+            INSERT INTO @DebugLog (LogMessage, LogTime)
+            VALUES ('Instance-level Error: ' + ERROR_MESSAGE(), GETDATE());
+        END CATCH
+
+        -- Database-level checks for this instance (set-based approach)
+        BEGIN TRY
+            -- Page Verify Check
+            MERGE INTO SQLBestPracticeMonitoring AS Target
+            USING (
+                SELECT database_id, page_verify_option_desc
+                FROM sys.databases
+                WHERE name NOT IN ('master', 'model', 'msdb', 'tempdb') AND database_id > 4
+            ) AS Source (DBID, CurrentValue)
+            ON (Target.InstanceID = @InstanceID AND Target.DBID = Source.DBID AND Target.BestPracticeName = 'PageVerify' AND Target.Status = 'Unresolved' AND Source.CurrentValue = 'CHECKSUM')
+            WHEN MATCHED THEN
+                UPDATE SET Status = 'Resolved', CurrentValue = 'CHECKSUM', Notes = 'Page Verify is set to CHECKSUM.', ResolvedDate = GETDATE(), LastChecked = GETDATE()
+            WHEN NOT MATCHED BY TARGET AND Source.CurrentValue != 'CHECKSUM' THEN
+                INSERT (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+                VALUES (@InstanceID, Source.DBID, @InstanceName, DB_NAME(Source.DBID), 'PageVerify', Source.CurrentValue, 'CHECKSUM', 'Unresolved', 'Page Verify should be set to CHECKSUM for data integrity.');
+            
+            -- Recovery Model Check
+            MERGE INTO SQLBestPracticeMonitoring AS Target
+            USING (
+                SELECT database_id, recovery_model_desc
+                FROM sys.databases
+                WHERE name NOT IN ('master', 'model', 'msdb', 'tempdb') AND database_id > 4
+            ) AS Source (DBID, CurrentValue)
+            ON (Target.InstanceID = @InstanceID AND Target.DBID = Source.DBID AND Target.BestPracticeName = 'RecoveryModel' AND Target.Status = 'Unresolved' AND Source.CurrentValue = 'FULL')
+            WHEN MATCHED THEN
+                UPDATE SET Status = 'Resolved', CurrentValue = 'FULL', Notes = 'Recovery Model is FULL.', ResolvedDate = GETDATE(), LastChecked = GETDATE()
+            WHEN NOT MATCHED BY TARGET AND Source.CurrentValue != 'FULL' THEN
+                INSERT (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+                VALUES (@InstanceID, Source.DBID, @InstanceName, DB_NAME(Source.DBID), 'RecoveryModel', Source.CurrentValue, 'FULL', 'Unresolved', 'Recovery Model should be FULL for production databases.');
+
+            -- Auto Close Check
+            MERGE INTO SQLBestPracticeMonitoring AS Target
+            USING (
+                SELECT database_id, is_auto_close_on
+                FROM sys.databases
+                WHERE name NOT IN ('master', 'model', 'msdb', 'tempdb') AND database_id > 4
+            ) AS Source (DBID, IsAutoCloseOn)
+            ON (Target.InstanceID = @InstanceID AND Target.DBID = Source.DBID AND Target.BestPracticeName = 'AutoClose' AND Target.Status = 'Unresolved' AND Source.IsAutoCloseOn = 0)
+            WHEN MATCHED THEN
+                UPDATE SET Status = 'Resolved', CurrentValue = 'OFF', Notes = 'Auto_Close is set to OFF.', ResolvedDate = GETDATE(), LastChecked = GETDATE()
+            WHEN NOT MATCHED BY TARGET AND Source.IsAutoCloseOn = 1 THEN
+                INSERT (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+                VALUES (@InstanceID, Source.DBID, @InstanceName, DB_NAME(Source.DBID), 'AutoClose', 'ON', 'OFF', 'Unresolved', 'Auto_Close should be OFF to avoid performance overhead.');
+
+            -- Auto Shrink Check
+            MERGE INTO SQLBestPracticeMonitoring AS Target
+            USING (
+                SELECT database_id, is_auto_shrink_on
+                FROM sys.databases
+                WHERE name NOT IN ('master', 'model', 'msdb', 'tempdb') AND database_id > 4
+            ) AS Source (DBID, IsAutoShrinkOn)
+            ON (Target.InstanceID = @InstanceID AND Target.DBID = Source.DBID AND Target.BestPracticeName = 'AutoShrink' AND Target.Status = 'Unresolved' AND Source.IsAutoShrinkOn = 0)
+            WHEN MATCHED THEN
+                UPDATE SET Status = 'Resolved', CurrentValue = 'OFF', Notes = 'Auto_Shrink is set to OFF.', ResolvedDate = GETDATE(), LastChecked = GETDATE()
+            WHEN NOT MATCHED BY TARGET AND Source.IsAutoShrinkOn = 1 THEN
+                INSERT (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+                VALUES (@InstanceID, Source.DBID, @InstanceName, DB_NAME(Source.DBID), 'AutoShrink', 'ON', 'OFF', 'Unresolved', 'Auto_Shrink should be OFF as it causes logical fragmentation and high resource usage.');
+
+            -- Trustworthy Check
+            MERGE INTO SQLBestPracticeMonitoring AS Target
+            USING (
+                SELECT database_id, is_trustworthy_on
+                FROM sys.databases
+                WHERE name NOT IN ('master', 'model', 'msdb', 'tempdb') AND database_id > 4
+            ) AS Source (DBID, IsTrustworthyOn)
+            ON (Target.InstanceID = @InstanceID AND Target.DBID = Source.DBID AND Target.BestPracticeName = 'Trustworthy' AND Target.Status = 'Unresolved' AND Source.IsTrustworthyOn = 0)
+            WHEN MATCHED THEN
+                UPDATE SET Status = 'Resolved', CurrentValue = 'OFF', Notes = 'Trustworthy is set to OFF.', ResolvedDate = GETDATE(), LastChecked = GETDATE()
+            WHEN NOT MATCHED BY TARGET AND Source.IsTrustworthyOn = 1 THEN
+                INSERT (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+                VALUES (@InstanceID, Source.DBID, @InstanceName, DB_NAME(Source.DBID), 'Trustworthy', 'ON', 'OFF', 'Unresolved', 'Trustworthy should be OFF to prevent security risks.');
+            
+            -- Compatibility Level Check (flag anything older than the latest two versions)
+            MERGE INTO SQLBestPracticeMonitoring AS Target
+            USING (
+                SELECT database_id, compatibility_level
+                FROM sys.databases
+                WHERE name NOT IN ('master', 'model', 'msdb', 'tempdb') AND database_id > 4 AND compatibility_level < @LatestCompatLevel - 10
+            ) AS Source (DBID, CurrentValue)
+            ON (Target.InstanceID = @InstanceID AND Target.DBID = Source.DBID AND Target.BestPracticeName = 'CompatibilityLevel' AND Target.Status = 'Unresolved')
+            WHEN MATCHED THEN
+                -- Do nothing, as it is still an issue
+                UPDATE SET Notes = 'Compatibility Level is too low. Recommended: ' + CAST(@LatestCompatLevel AS NVARCHAR(10)) + '.', LastChecked = GETDATE()
+            WHEN NOT MATCHED BY TARGET AND Source.CurrentValue < @LatestCompatLevel - 10 THEN
+                INSERT (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+                VALUES (@InstanceID, Source.DBID, @InstanceName, DB_NAME(Source.DBID), 'CompatibilityLevel', CAST(Source.CurrentValue AS NVARCHAR(255)), CAST(@LatestCompatLevel AS NVARCHAR(255)), 'Unresolved', 'Compatibility Level is too low. Recommended: ' + CAST(@LatestCompatLevel AS NVARCHAR(10)) + ' for new features.');
+            
+            -- Resolve old compatibility level issues if they have been updated
+            UPDATE Target
+            SET Status = 'Resolved', ResolvedDate = GETDATE(), LastChecked = GETDATE(), Notes = 'Compatibility Level has been updated.'
+            FROM SQLBestPracticeMonitoring AS Target
+            JOIN sys.databases AS d ON Target.DBID = d.database_id
+            WHERE Target.InstanceID = @InstanceID
+                AND Target.BestPracticeName = 'CompatibilityLevel'
+                AND Target.Status = 'Unresolved'
+                AND d.compatibility_level >= @LatestCompatLevel - 10;
+        
+        END TRY
+        BEGIN CATCH
+            INSERT INTO SQLBestPracticeMonitoringErrors (
+                InstanceID, DBID, DatabaseName, BestPracticeName,
+                ErrorMessage, ErrorLine, LogTime
+            )
+            VALUES (
+                ISNULL(@InstanceID, -1),
+                ISNULL(@DBID, -1),
+                ISNULL(@DBName, 'Unknown'),
+                'DatabaseLevel',
+                ERROR_MESSAGE(),
+                ERROR_LINE(),
+                GETDATE()
+            );
+            INSERT INTO @DebugLog (LogMessage, LogTime)
+            VALUES ('Database-level Error: ' + ERROR_MESSAGE(), GETDATE());
+        END CATCH
+
+        FETCH NEXT FROM instance_cursor INTO @InstanceID, @InstanceName;
+    END
+
+    CLOSE instance_cursor;
+    DEALLOCATE instance_cursor;
+
+    -- Output Debug Log
+    SELECT * FROM @DebugLog ORDER BY LogTime ASC;
+
+    -- Output summary of unresolved issues
+    SELECT BestPracticeName, DatabaseName, Status, COUNT(*) AS IssueCount
+    FROM SQLBestPracticeMonitoring
+    WHERE Status = 'Unresolved'
+    GROUP BY BestPracticeName, DatabaseName, Status
+    ORDER BY BestPracticeName, DatabaseName;
+
+    PRINT 'SQL Best Practices Check Completed at ' + CONVERT(NVARCHAR(30), GETDATE(), 120);
+END
+GO
