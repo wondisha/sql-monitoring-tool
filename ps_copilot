@@ -1,0 +1,90 @@
+# Requires: dbatools
+# Assumes central monitoring table schema supports relevant columns
+# PowerShell 7+ recommended for parallel execution if needed
+
+# Central inventory
+$centralServer = "YourCentralSqlServer"
+$instanceQuery = "SELECT Instance FROM abc.dbo.instance"
+$instances = Invoke-DbaQuery -SqlInstance $centralServer -Query $instanceQuery | Select-Object -ExpandProperty Instance
+
+function Update-BestPracticeStatus {
+    param (
+        [string]$instance,
+        [string]$dbName,
+        [string]$centralServer,
+        [string]$bestPractice,
+        [string]$currentValue,
+        [bool]$isResolved
+    )
+
+    $status = if ($isResolved) { 'Resolved' } else { 'Unresolved' }
+    $resolvedDate = if ($isResolved) { 'GETDATE()' } else { 'NULL' }
+
+    $query = @"
+        UPDATE SQLBestPracticeMonitoring
+        SET CurrentValue = '$currentValue',
+            Status = '$status',
+            Notes = 'Checked by dbatools',
+            ResolvedDate = $resolvedDate
+        WHERE InstanceName = '$instance'
+          AND DatabaseName = '$dbName'
+          AND BestPracticeName = '$bestPractice'
+    "@
+
+    Invoke-DbaQuery -SqlInstance $centralServer -Query $query
+}
+
+foreach ($instance in $instances) {
+    try {
+        # Global settings
+        $maxdop = (Get-DbaSpConfigure -SqlInstance $instance -Name 'max degree of parallelism').ConfigValue
+        $costThreshold = (Get-DbaSpConfigure -SqlInstance $instance -Name 'cost threshold for parallelism').ConfigValue
+
+        Update-BestPracticeStatus -instance $instance -dbName '' -centralServer $centralServer `
+            -bestPractice 'MaxDOP' -currentValue $maxdop -isResolved ($maxdop -eq 8)
+
+        Update-BestPracticeStatus -instance $instance -dbName '' -centralServer $centralServer `
+            -bestPractice 'CostThreshold' -currentValue $costThreshold -isResolved ($costThreshold -eq 50)
+
+        # Per-database settings
+        $dbs = Get-DbaDatabase -SqlInstance $instance | Where-Object { $_.Name -notin @('master','model','msdb','tempdb') }
+        foreach ($db in $dbs) {
+            $dbName = $db.Name
+            $autoshrink = $db.AutoShrink
+            $recovery = $db.RecoveryModel
+            $pageVerify = $db.PageVerifyOption
+
+            $autoshrinkValue = if ($autoshrink) { "Yes" } else { "No" }
+
+            Update-BestPracticeStatus -instance $instance -dbName $dbName -centralServer $centralServer `
+                -bestPractice 'AutoShrink' -currentValue $autoshrinkValue -isResolved ($autoshrink -eq $false)
+
+            Update-BestPracticeStatus -instance $instance -dbName $dbName -centralServer $centralServer `
+                -bestPractice 'RecoveryModel' -currentValue $recovery -isResolved ($recovery -eq 'FULL')
+
+            Update-BestPracticeStatus -instance $instance -dbName $dbName -centralServer $centralServer `
+                -bestPractice 'PageVerify' -currentValue $pageVerify -isResolved ($pageVerify -eq 'CHECKSUM')
+        }
+
+        # Tempdb file count check
+        $tempdbFiles = Get-DbaDatabaseFile -SqlInstance $instance -Database tempdb | Where-Object { $_.Type -eq 'Data' }
+        $fileCount = $tempdbFiles.Count
+
+        Update-BestPracticeStatus -instance $instance -dbName 'tempdb' -centralServer $centralServer `
+            -bestPractice 'TempdbFiles' -currentValue $fileCount -isResolved ($fileCount -ge 4)
+
+    } catch {
+        $errorMsg = $_.Exception.Message.Replace("'", "''")
+        $logQuery = @"
+            INSERT INTO SQLBestPracticeMonitoringErrors (
+                InstanceID, DBID, DatabaseName, BestPracticeName,
+                ErrorMessage, ErrorLine, LogTime
+            )
+            VALUES (
+                NULL, NULL, '$instance', 'BestPracticeCheck',
+                '$errorMsg', NULL, GETDATE()
+            )
+        "@
+        Invoke-DbaQuery -SqlInstance $centralServer -Query $logQuery
+    }
+}
