@@ -769,4 +769,24 @@ GO
 -- 5) Recreate canonical unique index
 CREATE UNIQUE INDEX UX_SQLBestPracticeMonitoring_Key
 ON dbo.SQLBestPracticeMonitoring (InstanceID, DBID, BestPracticeName);
+
+
+
+;WITH t AS (
+    SELECT size, growth, is_percent_growth
+    FROM sys.master_files
+    WHERE database_id = DB_ID('tempdb') AND type = 0
+)
+SELECT
+    @TempdbUniformSize =
+        CASE WHEN MIN(size) = MAX(size)
+               AND MIN(growth) = MAX(growth)
+               AND MIN(CAST(is_percent_growth AS TINYINT)) = MAX(CAST(is_percent_growth AS TINYINT))
+             THEN 1 ELSE 0 END,
+    @TempdbGrowthInMBOnly =
+        CASE WHEN MIN(CAST(is_percent_growth AS TINYINT)) = 0
+               AND MAX(CAST(is_percent_growth AS TINYINT)) = 0
+             THEN 1 ELSE 0 END
+FROM t;
+
 GO
