@@ -790,3 +790,183 @@ SELECT
 FROM t;
 
 GO
+
+
+-- Build a reusable set of user databases
+IF OBJECT_ID('tempdb..#dbs') IS NOT NULL DROP TABLE #dbs;
+
+CREATE TABLE #dbs (
+    DBID INT NOT NULL PRIMARY KEY,
+    DBName SYSNAME NOT NULL,
+    page_verify_option_desc NVARCHAR(60) NOT NULL,
+    recovery_model_desc NVARCHAR(60) NOT NULL,
+    is_auto_close_on BIT NOT NULL,
+    is_auto_shrink_on BIT NOT NULL,
+    is_read_committed_snapshot_on BIT NOT NULL,
+    compatibility_level INT NOT NULL,
+    is_adr_on BIT NULL  -- SQL 2019+; leave NULL on older versions
+);
+
+INSERT #dbs (DBID, DBName, page_verify_option_desc, recovery_model_desc,
+             is_auto_close_on, is_auto_shrink_on, is_read_committed_snapshot_on,
+             compatibility_level, is_adr_on)
+SELECT d.database_id, d.name, d.page_verify_option_desc, d.recovery_model_desc,
+       d.is_auto_close_on, d.is_auto_shrink_on, d.is_read_committed_snapshot_on,
+       d.compatibility_level,
+       TRY_CAST(d.is_accelerated_database_recovery_on AS BIT)
+FROM sys.databases AS d
+WHERE d.database_id > 4
+  AND d.name NOT IN (N'master', N'model', N'msdb', N'tempdb');
+
+-- Page Verify = CHECKSUM
+UPDATE tgt
+  SET Status = CASE WHEN src.page_verify_option_desc = 'CHECKSUM' THEN 'Resolved' ELSE 'Unresolved' END,
+      CurrentValue = src.page_verify_option_desc,
+      RecommendedValue = 'CHECKSUM',
+      Notes = CASE WHEN src.page_verify_option_desc = 'CHECKSUM' THEN 'Page Verify is CHECKSUM.'
+                   ELSE 'Set Page Verify to CHECKSUM.' END,
+      LastChecked = GETDATE(),
+      ResolvedDate = CASE WHEN src.page_verify_option_desc = 'CHECKSUM' THEN GETDATE() ELSE tgt.ResolvedDate END
+FROM dbo.SQLBestPracticeMonitoring tgt
+JOIN #dbs src ON src.DBID = tgt.DBID
+WHERE tgt.InstanceID = @InstanceID AND tgt.BestPracticeName = 'PageVerify';
+
+INSERT dbo.SQLBestPracticeMonitoring (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+SELECT @InstanceID, src.DBID, @InstanceName, src.DBName, 'PageVerify',
+       src.page_verify_option_desc, 'CHECKSUM', 'Unresolved', 'Set Page Verify to CHECKSUM.'
+FROM #dbs src
+WHERE src.page_verify_option_desc <> 'CHECKSUM'
+  AND NOT EXISTS (SELECT 1 FROM dbo.SQLBestPracticeMonitoring t
+                  WHERE t.InstanceID=@InstanceID AND t.DBID=src.DBID AND t.BestPracticeName='PageVerify');
+
+-- Recovery Model = FULL
+UPDATE tgt
+  SET Status = CASE WHEN src.recovery_model_desc = 'FULL' THEN 'Resolved' ELSE 'Unresolved' END,
+      CurrentValue = src.recovery_model_desc,
+      RecommendedValue = 'FULL',
+      Notes = CASE WHEN src.recovery_model_desc = 'FULL' THEN 'Recovery Model is FULL.'
+                   ELSE 'Use FULL for production databases (ensure log backups).' END,
+      LastChecked = GETDATE(),
+      ResolvedDate = CASE WHEN src.recovery_model_desc = 'FULL' THEN GETDATE() ELSE tgt.ResolvedDate END
+FROM dbo.SQLBestPracticeMonitoring tgt
+JOIN #dbs src ON src.DBID = tgt.DBID
+WHERE tgt.InstanceID = @InstanceID AND tgt.BestPracticeName = 'RecoveryModel';
+
+INSERT dbo.SQLBestPracticeMonitoring (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+SELECT @InstanceID, src.DBID, @InstanceName, src.DBName, 'RecoveryModel',
+       src.recovery_model_desc, 'FULL', 'Unresolved', 'Use FULL for production databases (ensure log backups).'
+FROM #dbs src
+WHERE src.recovery_model_desc <> 'FULL'
+  AND NOT EXISTS (SELECT 1 FROM dbo.SQLBestPracticeMonitoring t
+                  WHERE t.InstanceID=@InstanceID AND t.DBID=src.DBID AND t.BestPracticeName='RecoveryModel');
+
+-- Auto Close = OFF
+UPDATE tgt
+  SET Status = CASE WHEN src.is_auto_close_on = 0 THEN 'Resolved' ELSE 'Unresolved' END,
+      CurrentValue = CASE WHEN src.is_auto_close_on = 0 THEN 'OFF' ELSE 'ON' END,
+      RecommendedValue = 'OFF',
+      Notes = CASE WHEN src.is_auto_close_on = 0 THEN 'AUTO_CLOSE is OFF.'
+                   ELSE 'Disable AUTO_CLOSE to avoid overhead.' END,
+      LastChecked = GETDATE(),
+      ResolvedDate = CASE WHEN src.is_auto_close_on = 0 THEN GETDATE() ELSE tgt.ResolvedDate END
+FROM dbo.SQLBestPracticeMonitoring tgt
+JOIN #dbs src ON src.DBID = tgt.DBID
+WHERE tgt.InstanceID = @InstanceID AND tgt.BestPracticeName = 'AutoClose';
+
+INSERT dbo.SQLBestPracticeMonitoring (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+SELECT @InstanceID, src.DBID, @InstanceName, src.DBName, 'AutoClose',
+       'ON', 'OFF', 'Unresolved', 'Disable AUTO_CLOSE to avoid overhead.'
+FROM #dbs src
+WHERE src.is_auto_close_on = 1
+  AND NOT EXISTS (SELECT 1 FROM dbo.SQLBestPracticeMonitoring t
+                  WHERE t.InstanceID=@InstanceID AND t.DBID=src.DBID AND t.BestPracticeName='AutoClose');
+
+-- Auto Shrink = OFF
+UPDATE tgt
+  SET Status = CASE WHEN src.is_auto_shrink_on = 0 THEN 'Resolved' ELSE 'Unresolved' END,
+      CurrentValue = CASE WHEN src.is_auto_shrink_on = 0 THEN 'OFF' ELSE 'ON' END,
+      RecommendedValue = 'OFF',
+      Notes = CASE WHEN src.is_auto_shrink_on = 0 THEN 'AUTO_SHRINK is OFF.'
+                   ELSE 'Disable AUTO_SHRINK; it causes fragmentation and overhead.' END,
+      LastChecked = GETDATE(),
+      ResolvedDate = CASE WHEN src.is_auto_shrink_on = 0 THEN GETDATE() ELSE tgt.ResolvedDate END
+FROM dbo.SQLBestPracticeMonitoring tgt
+JOIN #dbs src ON src.DBID = tgt.DBID
+WHERE tgt.InstanceID = @InstanceID AND tgt.BestPracticeName = 'AutoShrink';
+
+INSERT dbo.SQLBestPracticeMonitoring (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+SELECT @InstanceID, src.DBID, @InstanceName, src.DBName, 'AutoShrink',
+       'ON', 'OFF', 'Unresolved', 'Disable AUTO_SHRINK; it causes fragmentation and overhead.'
+FROM #dbs src
+WHERE src.is_auto_shrink_on = 1
+  AND NOT EXISTS (SELECT 1 FROM dbo.SQLBestPracticeMonitoring t
+                  WHERE t.InstanceID=@InstanceID AND t.DBID=src.DBID AND t.BestPracticeName='AutoShrink');
+
+-- RCSI = ON (optional policy)
+UPDATE tgt
+  SET Status = CASE WHEN src.is_read_committed_snapshot_on = 1 THEN 'Resolved' ELSE 'Unresolved' END,
+      CurrentValue = CASE WHEN src.is_read_committed_snapshot_on = 1 THEN 'ON' ELSE 'OFF' END,
+      RecommendedValue = 'ON',
+      Notes = CASE WHEN src.is_read_committed_snapshot_on = 1 THEN 'RCSI is ON.'
+                   ELSE 'Consider enabling RCSI to reduce blocking (validate workload).' END,
+      LastChecked = GETDATE(),
+      ResolvedDate = CASE WHEN src.is_read_committed_snapshot_on = 1 THEN GETDATE() ELSE tgt.ResolvedDate END
+FROM dbo.SQLBestPracticeMonitoring tgt
+JOIN #dbs src ON src.DBID = tgt.DBID
+WHERE tgt.InstanceID = @InstanceID AND tgt.BestPracticeName = 'RCSI';
+
+INSERT dbo.SQLBestPracticeMonitoring (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+SELECT @InstanceID, src.DBID, @InstanceName, src.DBName, 'RCSI',
+       'OFF', 'ON', 'Unresolved', 'Consider enabling RCSI to reduce blocking (validate workload).'
+FROM #dbs src
+WHERE src.is_read_committed_snapshot_on = 0
+  AND NOT EXISTS (SELECT 1 FROM dbo.SQLBestPracticeMonitoring t
+                  WHERE t.InstanceID=@InstanceID AND t.DBID=src.DBID AND t.BestPracticeName='RCSI');
+
+-- ADR = ON (SQL 2019+ only; skip when is_adr_on is NULL)
+UPDATE tgt
+  SET Status = CASE WHEN src.is_adr_on = 1 THEN 'Resolved' ELSE 'Unresolved' END,
+      CurrentValue = CASE WHEN src.is_adr_on = 1 THEN 'ON' ELSE 'OFF' END,
+      RecommendedValue = 'ON',
+      Notes = CASE WHEN src.is_adr_on = 1 THEN 'ADR is ON.'
+                   ELSE 'Enable Accelerated Database Recovery (2019+).' END,
+      LastChecked = GETDATE(),
+      ResolvedDate = CASE WHEN src.is_adr_on = 1 THEN GETDATE() ELSE tgt.ResolvedDate END
+FROM dbo.SQLBestPracticeMonitoring tgt
+JOIN #dbs src ON src.DBID = tgt.DBID
+WHERE tgt.InstanceID = @InstanceID AND tgt.BestPracticeName = 'ADR'
+  AND src.is_adr_on IS NOT NULL;
+
+INSERT dbo.SQLBestPracticeMonitoring (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+SELECT @InstanceID, src.DBID, @InstanceName, src.DBName, 'ADR',
+       'OFF', 'ON', 'Unresolved', 'Enable Accelerated Database Recovery (2019+).'
+FROM #dbs src
+WHERE src.is_adr_on = 0
+  AND src.is_adr_on IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM dbo.SQLBestPracticeMonitoring t
+                  WHERE t.InstanceID=@InstanceID AND t.DBID=src.DBID AND t.BestPracticeName='ADR');
+
+-- Compatibility level: warn when two versions behind
+UPDATE tgt
+  SET Status = CASE WHEN src.compatibility_level >= @LatestCompatLevel - @CompatWarnDelta THEN 'Resolved' ELSE 'Unresolved' END,
+      CurrentValue = CAST(src.compatibility_level AS NVARCHAR(10)),
+      RecommendedValue = CAST(@LatestCompatLevel AS NVARCHAR(10)),
+      Notes = CASE WHEN src.compatibility_level >= @LatestCompatLevel - @CompatWarnDelta
+                   THEN 'Compatibility level is acceptable.'
+                   ELSE 'Compatibility is behind; consider upgrading for new features/perf.' END,
+      LastChecked = GETDATE(),
+      ResolvedDate = CASE WHEN src.compatibility_level >= @LatestCompatLevel - @CompatWarnDelta THEN GETDATE() ELSE tgt.ResolvedDate END
+FROM dbo.SQLBestPracticeMonitoring tgt
+JOIN #dbs src ON src.DBID = tgt.DBID
+WHERE tgt.InstanceID = @InstanceID AND tgt.BestPracticeName = 'CompatibilityLevel';
+
+INSERT dbo.SQLBestPracticeMonitoring (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+SELECT @InstanceID, src.DBID, @InstanceName, src.DBName, 'CompatibilityLevel',
+       CAST(src.compatibility_level AS NVARCHAR(10)),
+       CAST(@LatestCompatLevel AS NVARCHAR(10)),
+       'Unresolved',
+       'Compatibility is behind; consider upgrading for new features/perf.'
+FROM #dbs src
+WHERE src.compatibility_level < @LatestCompatLevel - @CompatWarnDelta
+  AND NOT EXISTS (SELECT 1 FROM dbo.SQLBestPracticeMonitoring t
+                  WHERE t.InstanceID=@InstanceID AND t.DBID=src.DBID AND t.BestPracticeName='CompatibilityLevel');
