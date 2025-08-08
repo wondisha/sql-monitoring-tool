@@ -726,39 +726,47 @@ GO
 
 
 
--- Drop any misnamed/old index if it exists
+-- 1) Drop any old/mistyped indexes
 IF EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = OBJECT_ID(N'dbo.SQLBestPracticeMonitoring') AND name = N'UX_SQLBestPraticeMonitoring_key')
     DROP INDEX UX_SQLBestPraticeMonitoring_key ON dbo.SQLBestPracticeMonitoring;
 IF EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = OBJECT_ID(N'dbo.SQLBestPracticeMonitoring') AND name = N'UX_SQLBestPracticeMonitoring_Key')
     DROP INDEX UX_SQLBestPracticeMonitoring_Key ON dbo.SQLBestPracticeMonitoring;
+GO
 
--- Inspect duplicates (case-insensitive across BestPracticeName)
+-- 2) Normalize obvious name variants before dedup
+UPDATE dbo.SQLBestPracticeMonitoring
+SET BestPracticeName = N'TempdbFileCount'
+WHERE LOWER(BestPracticeName) IN (N'tempdbfilecount', N'tempfilecount');
+GO
+
+-- 3) Dedup WITHOUT assuming an ID column (uses dynamic ORDER BY based on existing cols)
+DECLARE @order NVARCHAR(MAX) = N'CASE WHEN Status = ''Resolved'' THEN 0 ELSE 1 END';
+IF COL_LENGTH('dbo.SQLBestPracticeMonitoring', 'LastChecked')   IS NOT NULL SET @order += N', LastChecked DESC';
+IF COL_LENGTH('dbo.SQLBestPracticeMonitoring', 'ResolvedDate')  IS NOT NULL SET @order += N', ResolvedDate DESC';
+IF COL_LENGTH('dbo.SQLBestPracticeMonitoring', 'ID')            IS NOT NULL SET @order += N', ID DESC';
+
+DECLARE @sql NVARCHAR(MAX) = N'
+;WITH d AS (
+  SELECT *,
+         ROW_NUMBER() OVER (
+           PARTITION BY InstanceID, DBID, LOWER(BestPracticeName)
+           ORDER BY ' + @order + N'
+         ) AS rn
+  FROM dbo.SQLBestPracticeMonitoring
+)
+DELETE FROM d WHERE rn > 1;';
+EXEC sp_executesql @sql;
+GO
+
+-- 4) Verify no dupes remain (optional)
 SELECT InstanceID, DBID, LOWER(BestPracticeName) AS BPName, COUNT(*) AS Cnt
 FROM dbo.SQLBestPracticeMonitoring
 GROUP BY InstanceID, DBID, LOWER(BestPracticeName)
 HAVING COUNT(*) > 1
 ORDER BY Cnt DESC, InstanceID, DBID, BPName;
+GO
 
--- Normalize obvious typos/casing for the failing key(s)
-UPDATE dbo.SQLBestPracticeMonitoring
-SET BestPracticeName = N'TempdbFileCount'
-WHERE LOWER(BestPracticeName) IN (N'tempdbfilecount', N'tempfilecount');
-
--- One-time dedup: keep the "best" row, delete extras
-;WITH d AS (
-  SELECT
-    ID,
-    ROW_NUMBER() OVER (
-      PARTITION BY InstanceID, DBID, LOWER(BestPracticeName)
-      ORDER BY
-        CASE WHEN Status = 'Resolved' THEN 1 ELSE 2 END,
-        LastChecked DESC,
-        ID DESC
-    ) AS rn
-  FROM dbo.SQLBestPracticeMonitoring
-)
-DELETE FROM d WHERE rn > 1;
-
--- Recreate the canonical unique index
+-- 5) Recreate canonical unique index
 CREATE UNIQUE INDEX UX_SQLBestPracticeMonitoring_Key
 ON dbo.SQLBestPracticeMonitoring (InstanceID, DBID, BestPracticeName);
+GO
