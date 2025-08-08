@@ -722,3 +722,43 @@ BEGIN
     PRINT 'SQL Best Practices Check Completed at ' + CONVERT(NVARCHAR(30), GETDATE(), 120);
 END
 GO
+
+
+
+
+-- Drop any misnamed/old index if it exists
+IF EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = OBJECT_ID(N'dbo.SQLBestPracticeMonitoring') AND name = N'UX_SQLBestPraticeMonitoring_key')
+    DROP INDEX UX_SQLBestPraticeMonitoring_key ON dbo.SQLBestPracticeMonitoring;
+IF EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = OBJECT_ID(N'dbo.SQLBestPracticeMonitoring') AND name = N'UX_SQLBestPracticeMonitoring_Key')
+    DROP INDEX UX_SQLBestPracticeMonitoring_Key ON dbo.SQLBestPracticeMonitoring;
+
+-- Inspect duplicates (case-insensitive across BestPracticeName)
+SELECT InstanceID, DBID, LOWER(BestPracticeName) AS BPName, COUNT(*) AS Cnt
+FROM dbo.SQLBestPracticeMonitoring
+GROUP BY InstanceID, DBID, LOWER(BestPracticeName)
+HAVING COUNT(*) > 1
+ORDER BY Cnt DESC, InstanceID, DBID, BPName;
+
+-- Normalize obvious typos/casing for the failing key(s)
+UPDATE dbo.SQLBestPracticeMonitoring
+SET BestPracticeName = N'TempdbFileCount'
+WHERE LOWER(BestPracticeName) IN (N'tempdbfilecount', N'tempfilecount');
+
+-- One-time dedup: keep the "best" row, delete extras
+;WITH d AS (
+  SELECT
+    ID,
+    ROW_NUMBER() OVER (
+      PARTITION BY InstanceID, DBID, LOWER(BestPracticeName)
+      ORDER BY
+        CASE WHEN Status = 'Resolved' THEN 1 ELSE 2 END,
+        LastChecked DESC,
+        ID DESC
+    ) AS rn
+  FROM dbo.SQLBestPracticeMonitoring
+)
+DELETE FROM d WHERE rn > 1;
+
+-- Recreate the canonical unique index
+CREATE UNIQUE INDEX UX_SQLBestPracticeMonitoring_Key
+ON dbo.SQLBestPracticeMonitoring (InstanceID, DBID, BestPracticeName);
