@@ -1,0 +1,724 @@
+SET ANSI_NULLS ON;
+SET QUOTED_IDENTIFIER ON;
+GO
+
+-- Error logging table creation (idempotent)
+IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE object_id = OBJECT_ID(N'dbo.SQLBestPracticeMonitoringErrors'))
+BEGIN
+    CREATE TABLE dbo.SQLBestPracticeMonitoringErrors (
+        InstanceID INT,
+        DBID INT,
+        DatabaseName SYSNAME,
+        BestPracticeName NVARCHAR(100),
+        ErrorMessage NVARCHAR(MAX),
+        ErrorLine INT,
+        LogTime DATETIME
+    );
+END
+GO
+
+-- Main monitoring table creation (idempotent)
+IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE object_id = OBJECT_ID(N'dbo.SQLBestPracticeMonitoring'))
+BEGIN
+    CREATE TABLE dbo.SQLBestPracticeMonitoring (
+        ID INT IDENTITY(1,1) PRIMARY KEY,
+        InstanceID INT NOT NULL,
+        DBID INT NOT NULL,
+        InstanceName NVARCHAR(128) NULL,
+        DatabaseName SYSNAME NULL,
+        BestPracticeName NVARCHAR(100) NOT NULL,
+        CurrentValue NVARCHAR(MAX) NULL,
+        RecommendedValue NVARCHAR(MAX) NULL,
+        Status NVARCHAR(50) NOT NULL DEFAULT ('Unresolved'), -- 'Unresolved', 'Resolved'
+        Notes NVARCHAR(MAX) NULL,
+        LastChecked DATETIME NOT NULL DEFAULT (GETDATE()),
+        ResolvedDate DATETIME NULL
+    );
+END
+GO
+
+-- Deterministic key for upsert and to prevent duplicates
+IF NOT EXISTS (
+    SELECT 1
+    FROM sys.indexes
+    WHERE name = N'UX_SQLBestPracticeMonitoring_Key'
+      AND object_id = OBJECT_ID(N'dbo.SQLBestPracticeMonitoring')
+)
+BEGIN
+    CREATE UNIQUE INDEX UX_SQLBestPracticeMonitoring_Key
+    ON dbo.SQLBestPracticeMonitoring (InstanceID, DBID, BestPracticeName);
+END
+GO
+
+-- Helper index for summaries
+IF NOT EXISTS (
+    SELECT 1
+    FROM sys.indexes
+    WHERE name = N'IX_SQLBestPracticeMonitoring_Status'
+      AND object_id = OBJECT_ID(N'dbo.SQLBestPracticeMonitoring')
+)
+BEGIN
+    CREATE INDEX IX_SQLBestPracticeMonitoring_Status
+    ON dbo.SQLBestPracticeMonitoring (Status, BestPracticeName, DatabaseName);
+END
+GO
+
+ALTER PROCEDURE [dbo].[usp_CheckSQLBestPractices]
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @Now DATETIME = GETDATE();
+    DECLARE @DebugLog TABLE (LogMessage NVARCHAR(MAX), LogTime DATETIME);
+
+    -- Resolve current instance identity
+    DECLARE @InstanceName NVARCHAR(128) = CAST(SERVERPROPERTY('ServerName') AS NVARCHAR(128));
+    DECLARE @InstanceID INT =
+        (SELECT TOP(1) InstanceID FROM dbo.Instances WHERE Instance = @InstanceName);
+    IF @InstanceID IS NULL SET @InstanceID = 0;
+
+    INSERT INTO @DebugLog VALUES (N'Starting SQL Best Practices Check for ' + ISNULL(@InstanceName,N'?'), @Now);
+
+    -------------------------------------------------------------------------
+    -- Server info and recommendations (robust, with fallbacks)
+    -------------------------------------------------------------------------
+    DECLARE
+        @ProductMajorVersion INT = TRY_CAST(SERVERPROPERTY('ProductMajorVersion') AS INT),
+        @TotalLogicalProcessors INT = NULL,
+        @TotalPhysicalMemoryMB BIGINT = NULL;
+
+    BEGIN TRY
+        SELECT @TotalLogicalProcessors = cpu_count FROM sys.dm_os_sys_info;
+    END TRY
+    BEGIN CATCH
+        SET @TotalLogicalProcessors = NULL;
+        INSERT INTO dbo.SQLBestPracticeMonitoringErrors
+            (InstanceID, DBID, DatabaseName, BestPracticeName, ErrorMessage, ErrorLine, LogTime)
+        VALUES
+            (@InstanceID, 0, N'InstanceLevel', N'ServerInfo',
+             ERROR_MESSAGE(), ERROR_LINE(), GETDATE());
+    END CATCH;
+
+    BEGIN TRY
+        SELECT @TotalPhysicalMemoryMB = total_physical_memory_kb / 1024
+        FROM sys.dm_os_sys_memory;
+    END TRY
+    BEGIN CATCH
+        SET @TotalPhysicalMemoryMB = NULL;
+        INSERT INTO dbo.SQLBestPracticeMonitoringErrors
+            (InstanceID, DBID, DatabaseName, BestPracticeName, ErrorMessage, ErrorLine, LogTime)
+        VALUES
+            (@InstanceID, 0, N'InstanceLevel', N'ServerInfo',
+             ERROR_MESSAGE(), ERROR_LINE(), GETDATE());
+    END CATCH;
+
+    -- Calculate recommended MaxDOP (logical per NUMA, cap 8)
+    DECLARE @NUMANodeCount INT = NULL, @LogicalPerNUMA INT = NULL, @RecommendedMaxDOP INT = NULL;
+    BEGIN TRY
+        SELECT @NUMANodeCount = COUNT(DISTINCT node_id)
+        FROM sys.dm_os_nodes
+        WHERE node_state_desc = 'ONLINE' AND node_id < 64;
+
+        SET @LogicalPerNUMA = CASE WHEN ISNULL(@NUMANodeCount,0) > 0 AND @TotalLogicalProcessors IS NOT NULL
+                                   THEN @TotalLogicalProcessors / @NUMANodeCount
+                                   ELSE @TotalLogicalProcessors END;
+
+        SET @RecommendedMaxDOP =
+            CASE
+                WHEN @TotalLogicalProcessors IS NULL THEN NULL
+                WHEN @TotalLogicalProcessors <= 8 THEN @TotalLogicalProcessors
+                WHEN @LogicalPerNUMA IS NOT NULL AND @LogicalPerNUMA <= 8 THEN @LogicalPerNUMA
+                ELSE 8
+            END;
+    END TRY
+    BEGIN CATCH
+        SET @RecommendedMaxDOP = NULL;
+    END CATCH;
+
+    -- Latest compatibility level mapping and warning delta (two versions behind)
+    DECLARE @LatestCompatLevel INT =
+        CASE @ProductMajorVersion
+            WHEN 16 THEN 160  -- SQL 2022
+            WHEN 15 THEN 150  -- SQL 2019
+            WHEN 14 THEN 140  -- SQL 2017
+            WHEN 13 THEN 130  -- SQL 2016
+            ELSE 120          -- SQL 2014 or older fallback
+        END,
+        @CompatWarnDelta INT = 20;
+
+    -- Instance-level configuration reads
+    DECLARE
+        @CurrentMaxDOP INT = NULL,
+        @CurrentCostThreshold INT = NULL,
+        @RecommendedCostThreshold INT = 25, -- make configurable as needed
+        @MaxServerMemoryMB BIGINT = NULL,
+        @MinServerMemoryMB BIGINT = NULL;
+
+    BEGIN TRY
+        SELECT
+            @CurrentMaxDOP = TRY_CAST(MAXDOP.value_in_use AS INT),
+            @CurrentCostThreshold = TRY_CAST(CTP.value_in_use AS INT),
+            @MaxServerMemoryMB = TRY_CAST(MAXMEM.value_in_use AS BIGINT),
+            @MinServerMemoryMB = TRY_CAST(MINMEM.value_in_use AS BIGINT)
+        FROM sys.configurations AS MAXDOP
+        LEFT JOIN sys.configurations AS CTP   ON CTP.name   = 'cost threshold for parallelism'
+        LEFT JOIN sys.configurations AS MAXMEM ON MAXMEM.name = 'max server memory (MB)'
+        LEFT JOIN sys.configurations AS MINMEM ON MINMEM.name = 'min server memory (MB)'
+        WHERE MAXDOP.name = 'max degree of parallelism';
+    END TRY
+    BEGIN CATCH
+        INSERT INTO dbo.SQLBestPracticeMonitoringErrors
+            (InstanceID, DBID, DatabaseName, BestPracticeName, ErrorMessage, ErrorLine, LogTime)
+        VALUES
+            (@InstanceID, 0, N'InstanceLevel', N'Configurations',
+             ERROR_MESSAGE(), ERROR_LINE(), GETDATE());
+    END CATCH;
+
+    -- Better Max Server Memory recommendation:
+    -- Reserve: base 4096MB + 10% of remaining; clamp >= 1024MB reserve
+    DECLARE @ReserveMB BIGINT = NULL, @RecommendedMaxServerMemoryMB BIGINT = NULL;
+    IF @TotalPhysicalMemoryMB IS NOT NULL
+    BEGIN
+        SET @ReserveMB = 4096 + ((@TotalPhysicalMemoryMB - 4096) * 10) / 100;
+        IF @ReserveMB < 1024 SET @ReserveMB = 1024;
+        SET @RecommendedMaxServerMemoryMB = @TotalPhysicalMemoryMB - @ReserveMB;
+        IF @RecommendedMaxServerMemoryMB < 1024 SET @RecommendedMaxServerMemoryMB = 1024;
+    END
+
+    -- Tempdb checks
+    DECLARE
+        @TempdbFileCount INT = NULL,
+        @TempdbRecommendedFiles INT = NULL,
+        @TempdbUniformSize BIT = NULL,
+        @TempdbGrowthInMBOnly BIT = NULL;
+
+    BEGIN TRY
+        SELECT @TempdbFileCount = COUNT(*)
+        FROM sys.master_files
+        WHERE database_id = DB_ID('tempdb') AND type = 0; -- data files
+
+        -- Recommended count: CPUs up to 8, else 8; fallback 4
+        SET @TempdbRecommendedFiles = CASE
+            WHEN @TotalLogicalProcessors IS NULL OR @TotalLogicalProcessors <= 0 THEN 4
+            WHEN @TotalLogicalProcessors <= 8 THEN @TotalLogicalProcessors
+            ELSE 8 END;
+
+        -- Uniform size and MB growth
+        ;WITH t AS (
+            SELECT size, growth, is_percent_growth
+            FROM sys.master_files
+            WHERE database_id = DB_ID('tempdb') AND type = 0
+        )
+        SELECT
+            @TempdbUniformSize = CASE WHEN MIN(size) = MAX(size) AND MIN(growth) = MAX(growth) AND MIN(is_percent_growth) = MAX(is_percent_growth) THEN 1 ELSE 0 END,
+            @TempdbGrowthInMBOnly = CASE WHEN MIN(is_percent_growth) = 0 AND MAX(is_percent_growth) = 0 THEN 1 ELSE 0 END
+        FROM t;
+
+        INSERT INTO @DebugLog VALUES (N'TempDB data files: ' + CAST(@TempdbFileCount AS NVARCHAR(10)), GETDATE());
+    END TRY
+    BEGIN CATCH
+        SET @TempdbFileCount = -1;
+        INSERT INTO dbo.SQLBestPracticeMonitoringErrors
+            (InstanceID, DBID, DatabaseName, BestPracticeName, ErrorMessage, ErrorLine, LogTime)
+        VALUES
+            (@InstanceID, 2, N'tempdb', N'TempdbChecks',
+             ERROR_MESSAGE(), ERROR_LINE(), GETDATE());
+    END CATCH;
+
+    -- IFI detection (prefer DMV; fallback unknown)
+    DECLARE @IFIEnabled BIT = NULL;
+    BEGIN TRY
+        -- instant_file_initialization_enabled exists in newer versions
+        SELECT @IFIEnabled =
+            MAX(CASE WHEN instant_file_initialization_enabled = 1 THEN 1 ELSE 0 END)
+        FROM sys.dm_server_services
+        WHERE servicename LIKE N'SQL Server (%';
+    END TRY
+    BEGIN CATCH
+        SET @IFIEnabled = NULL; -- unknown
+    END CATCH;
+
+    -- LPIM detection via locked pages usage
+    DECLARE @LPIMEnabled BIT = NULL;
+    BEGIN TRY
+        SELECT @LPIMEnabled = CASE WHEN (SELECT locked_page_allocations_kb FROM sys.dm_os_process_memory) > 0 THEN 1 ELSE 0 END;
+    END TRY
+    BEGIN CATCH
+        SET @LPIMEnabled = NULL;
+    END CATCH;
+
+    -- system_health XE session check (modern replacement for default trace)
+    DECLARE @SystemHealthXE BIT = NULL;
+    BEGIN TRY
+        SELECT @SystemHealthXE = CASE WHEN EXISTS (SELECT 1 FROM sys.dm_xe_sessions WHERE name = N'system_health') THEN 1 ELSE 0 END;
+    END TRY
+    BEGIN CATCH
+        SET @SystemHealthXE = NULL;
+    END CATCH;
+
+    -------------------------------------------------------------------------
+    -- Reusable upsert pattern for a single best-practice check
+    -------------------------------------------------------------------------
+    -- Updates existing row (flips to Resolved when compliant). Inserts only if non-compliant and no row exists.
+    -- Parameters:
+    --   @DBID, @DBName, @BPName, @Current, @Recommended, @IsCompliant, @Notes
+    DECLARE @DBID INT, @DBName SYSNAME, @BPName NVARCHAR(100), @Current NVARCHAR(MAX), @Recommended NVARCHAR(MAX), @IsCompliant BIT, @Notes NVARCHAR(MAX);
+
+    -- Local procedure-like macro via inline pattern (used repeatedly)
+
+    -------------------------------------------------------------------------
+    -- Instance-level checks
+    -------------------------------------------------------------------------
+
+    -- MaxDOP
+    SET @DBID = 0; SET @DBName = N'InstanceLevel'; SET @BPName = N'MaxDOP';
+    SET @Current = COALESCE(CAST(@CurrentMaxDOP AS NVARCHAR(20)), N'Unknown');
+    SET @Recommended = COALESCE(CAST(@RecommendedMaxDOP AS NVARCHAR(20)), N'Unknown');
+    SET @IsCompliant = CASE WHEN @RecommendedMaxDOP IS NULL OR @CurrentMaxDOP IS NULL THEN 0
+                            WHEN @CurrentMaxDOP = @RecommendedMaxDOP THEN 1 ELSE 0 END;
+    SET @Notes = CASE WHEN @IsCompliant = 1 THEN N'MaxDOP is set as recommended.'
+                      ELSE N'MaxDOP should be ' + @Recommended + N' based on CPU/NUMA.' END;
+
+    UPDATE dbo.SQLBestPracticeMonitoring
+      SET Status = CASE WHEN @IsCompliant=1 THEN 'Resolved' ELSE 'Unresolved' END,
+          CurrentValue = @Current,
+          RecommendedValue = @Recommended,
+          Notes = @Notes,
+          LastChecked = GETDATE(),
+          ResolvedDate = CASE WHEN @IsCompliant=1 THEN GETDATE() ELSE ResolvedDate END
+    WHERE InstanceID = @InstanceID AND DBID = @DBID AND BestPracticeName = @BPName;
+
+    IF @@ROWCOUNT = 0 AND @IsCompliant = 0
+        INSERT dbo.SQLBestPracticeMonitoring
+            (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+        VALUES
+            (@InstanceID, @DBID, @InstanceName, @DBName, @BPName, @Current, @Recommended, 'Unresolved', @Notes);
+
+    -- Cost Threshold for Parallelism
+    SET @DBID = 0; SET @DBName = N'InstanceLevel'; SET @BPName = N'CostThresholdParallelism';
+    SET @Current = COALESCE(CAST(@CurrentCostThreshold AS NVARCHAR(20)), N'Unknown');
+    SET @Recommended = CAST(@RecommendedCostThreshold AS NVARCHAR(20));
+    SET @IsCompliant = CASE WHEN @CurrentCostThreshold IS NULL THEN 0
+                            WHEN @CurrentCostThreshold >= @RecommendedCostThreshold THEN 1 ELSE 0 END;
+    SET @Notes = CASE WHEN @IsCompliant = 1 THEN N'CTFP is appropriately configured.'
+                      ELSE N'CTFP should be at least ' + @Recommended + N'.' END;
+
+    UPDATE dbo.SQLBestPracticeMonitoring
+      SET Status = CASE WHEN @IsCompliant=1 THEN 'Resolved' ELSE 'Unresolved' END,
+          CurrentValue = @Current,
+          RecommendedValue = @Recommended,
+          Notes = @Notes,
+          LastChecked = GETDATE(),
+          ResolvedDate = CASE WHEN @IsCompliant=1 THEN GETDATE() ELSE ResolvedDate END
+    WHERE InstanceID = @InstanceID AND DBID = @DBID AND BestPracticeName = @BPName;
+
+    IF @@ROWCOUNT = 0 AND @IsCompliant = 0
+        INSERT dbo.SQLBestPracticeMonitoring
+            (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+        VALUES
+            (@InstanceID, @DBID, @InstanceName, @DBName, @BPName, @Current, @Recommended, 'Unresolved', @Notes);
+
+    -- Max Server Memory
+    SET @DBID = 0; SET @DBName = N'InstanceLevel'; SET @BPName = N'MaxServerMemory';
+    SET @Current = CASE WHEN @MaxServerMemoryMB IS NULL THEN N'Unknown'
+                        WHEN @MaxServerMemoryMB = 2147483647 THEN N'Unlimited (Default)'
+                        ELSE CAST(@MaxServerMemoryMB AS NVARCHAR(20)) + N' MB' END;
+    SET @Recommended = COALESCE(CAST(@RecommendedMaxServerMemoryMB AS NVARCHAR(20)) + N' MB', N'Unknown');
+
+    DECLARE @WithinBand BIT = NULL;
+    IF @RecommendedMaxServerMemoryMB IS NOT NULL AND @MaxServerMemoryMB IS NOT NULL AND @MaxServerMemoryMB <> 2147483647
+        SET @WithinBand = CASE WHEN @MaxServerMemoryMB BETWEEN CAST(@RecommendedMaxServerMemoryMB * 0.875 AS BIGINT)
+                                                 AND     CAST(@RecommendedMaxServerMemoryMB * 1.125 AS BIGINT)
+                               THEN 1 ELSE 0 END;
+    ELSE SET @WithinBand = 0;
+
+    SET @IsCompliant = CASE WHEN @WithinBand = 1 THEN 1 ELSE 0 END;
+    SET @Notes = CASE WHEN @IsCompliant = 1 THEN N'Max server memory is within recommended band (~±12.5%).'
+                      ELSE N'Configure max server memory to ~' + COALESCE(CAST(@RecommendedMaxServerMemoryMB AS NVARCHAR(20)) + N' MB', N'Unknown') + N' to reserve OS headroom.' END;
+
+    UPDATE dbo.SQLBestPracticeMonitoring
+      SET Status = CASE WHEN @IsCompliant=1 THEN 'Resolved' ELSE 'Unresolved' END,
+          CurrentValue = @Current,
+          RecommendedValue = @Recommended,
+          Notes = @Notes,
+          LastChecked = GETDATE(),
+          ResolvedDate = CASE WHEN @IsCompliant=1 THEN GETDATE() ELSE ResolvedDate END
+    WHERE InstanceID = @InstanceID AND DBID = @DBID AND BestPracticeName = @BPName;
+
+    IF @@ROWCOUNT = 0 AND @IsCompliant = 0
+        INSERT dbo.SQLBestPracticeMonitoring
+            (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+        VALUES
+            (@InstanceID, @DBID, @InstanceName, @DBName, @BPName, @Current, @Recommended, 'Unresolved', @Notes);
+
+    -- Min Server Memory (informational if 0)
+    SET @DBID = 0; SET @DBName = N'InstanceLevel'; SET @BPName = N'MinServerMemory';
+    SET @Current = COALESCE(CAST(@MinServerMemoryMB AS NVARCHAR(20)) + N' MB', N'Unknown');
+    DECLARE @RecommendedMinMB BIGINT = CASE WHEN @MaxServerMemoryMB IS NOT NULL THEN CAST(@MaxServerMemoryMB * 0.25 AS BIGINT) ELSE NULL END;
+    SET @Recommended = COALESCE(CAST(@RecommendedMinMB AS NVARCHAR(20)) + N' MB', N'Unknown');
+    SET @IsCompliant = CASE WHEN @MinServerMemoryMB IS NULL THEN 0 WHEN @MinServerMemoryMB > 0 THEN 1 ELSE 0 END;
+    SET @Notes = CASE WHEN @IsCompliant = 1 THEN N'Min server memory set (ensure it aligns with capacity goals).'
+                      ELSE N'Optional: set min server memory (e.g., ~25% of max) only if needed to protect memory from other workloads.' END;
+
+    UPDATE dbo.SQLBestPracticeMonitoring
+      SET Status = CASE WHEN @IsCompliant=1 THEN 'Resolved' ELSE 'Unresolved' END,
+          CurrentValue = @Current,
+          RecommendedValue = @Recommended,
+          Notes = @Notes,
+          LastChecked = GETDATE(),
+          ResolvedDate = CASE WHEN @IsCompliant=1 THEN GETDATE() ELSE ResolvedDate END
+    WHERE InstanceID = @InstanceID AND DBID = @DBID AND BestPracticeName = @BPName;
+
+    IF @@ROWCOUNT = 0 AND @IsCompliant = 0
+        INSERT dbo.SQLBestPracticeMonitoring
+            (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+        VALUES
+            (@InstanceID, @DBID, @InstanceName, @DBName, @BPName, @Current, @Recommended, 'Unresolved', @Notes);
+
+    -- Tempdb file count
+    SET @DBID = 2; SET @DBName = N'tempdb'; SET @BPName = N'TempdbFileCount';
+    SET @Current = CASE WHEN @TempdbFileCount IS NULL THEN N'Unknown' ELSE CAST(@TempdbFileCount AS NVARCHAR(10)) + N' files' END;
+    SET @Recommended = CASE WHEN @TempdbRecommendedFiles IS NULL THEN N'Unknown' ELSE CAST(@TempdbRecommendedFiles AS NVARCHAR(10)) + N' files' END;
+    SET @IsCompliant = CASE WHEN @TempdbFileCount IS NULL OR @TempdbRecommendedFiles IS NULL THEN 0
+                            WHEN @TempdbFileCount = @TempdbRecommendedFiles THEN 1 ELSE 0 END;
+    SET @Notes = CASE WHEN @IsCompliant=1 THEN N'Tempdb has an optimal number of data files.'
+                      ELSE N'Set tempdb to ' + COALESCE(CAST(@TempdbRecommendedFiles AS NVARCHAR(10)), N'?') + N' equally sized data files (up to 8).' END;
+
+    UPDATE dbo.SQLBestPracticeMonitoring
+      SET Status = CASE WHEN @IsCompliant=1 THEN 'Resolved' ELSE 'Unresolved' END,
+          CurrentValue = @Current,
+          RecommendedValue = @Recommended,
+          Notes = @Notes,
+          LastChecked = GETDATE(),
+          ResolvedDate = CASE WHEN @IsCompliant=1 THEN GETDATE() ELSE ResolvedDate END
+    WHERE InstanceID = @InstanceID AND DBID = @DBID AND BestPracticeName = @BPName;
+
+    IF @@ROWCOUNT = 0 AND @IsCompliant = 0
+        INSERT dbo.SQLBestPracticeMonitoring
+            (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+        VALUES
+            (@InstanceID, @DBID, @InstanceName, @DBName, @BPName, @Current, @Recommended, 'Unresolved', @Notes);
+
+    -- Tempdb growth unit
+    SET @BPName = N'TempdbGrowthInMBOnly';
+    SET @Current = CASE WHEN @TempdbGrowthInMBOnly IS NULL THEN N'Unknown'
+                        WHEN @TempdbGrowthInMBOnly = 1 THEN N'MB'
+                        ELSE N'Percent' END;
+    SET @Recommended = N'MB';
+    SET @IsCompliant = CASE WHEN @TempdbGrowthInMBOnly = 1 THEN 1 ELSE 0 END;
+    SET @Notes = CASE WHEN @IsCompliant=1 THEN N'Tempdb autogrowth uses MB.'
+                      ELSE N'Change tempdb data file autogrowth to MB (not %).' END;
+
+    UPDATE dbo.SQLBestPracticeMonitoring
+      SET Status = CASE WHEN @IsCompliant=1 THEN 'Resolved' ELSE 'Unresolved' END,
+          CurrentValue = @Current,
+          RecommendedValue = @Recommended,
+          Notes = @Notes,
+          LastChecked = GETDATE(),
+          ResolvedDate = CASE WHEN @IsCompliant=1 THEN GETDATE() ELSE ResolvedDate END
+    WHERE InstanceID = @InstanceID AND DBID = @DBID AND BestPracticeName = @BPName;
+
+    IF @@ROWCOUNT = 0 AND @IsCompliant = 0
+        INSERT dbo.SQLBestPracticeMonitoring
+            (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+        VALUES
+            (@InstanceID, @DBID, @InstanceName, @DBName, @BPName, @Current, @Recommended, 'Unresolved', @Notes);
+
+    -- Tempdb uniform sizing
+    SET @BPName = N'TempdbUniformSize';
+    SET @Current = CASE WHEN @TempdbUniformSize IS NULL THEN N'Unknown'
+                        WHEN @TempdbUniformSize = 1 THEN N'Uniform'
+                        ELSE N'Not uniform' END;
+    SET @Recommended = N'Uniform sizes and growth';
+    SET @IsCompliant = CASE WHEN @TempdbUniformSize = 1 THEN 1 ELSE 0 END;
+    SET @Notes = CASE WHEN @IsCompliant=1 THEN N'Tempdb files share equal size/growth.'
+                      ELSE N'Ensure equal initial size and growth across tempdb data files.' END;
+
+    UPDATE dbo.SQLBestPracticeMonitoring
+      SET Status = CASE WHEN @IsCompliant=1 THEN 'Resolved' ELSE 'Unresolved' END,
+          CurrentValue = @Current,
+          RecommendedValue = @Recommended,
+          Notes = @Notes,
+          LastChecked = GETDATE(),
+          ResolvedDate = CASE WHEN @IsCompliant=1 THEN GETDATE() ELSE ResolvedDate END
+    WHERE InstanceID = @InstanceID AND DBID = @DBID AND BestPracticeName = @BPName;
+
+    IF @@ROWCOUNT = 0 AND @IsCompliant = 0
+        INSERT dbo.SQLBestPracticeMonitoring
+            (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+        VALUES
+            (@InstanceID, @DBID, @InstanceName, @DBName, @BPName, @Current, @Recommended, 'Unresolved', @Notes);
+
+    -- Instant File Initialization
+    SET @DBID = 0; SET @DBName = N'InstanceLevel'; SET @BPName = N'InstantFileInitialization';
+    SET @Current = CASE WHEN @IFIEnabled IS NULL THEN N'Unknown' ELSE CASE WHEN @IFIEnabled=1 THEN N'Enabled' ELSE N'Disabled' END END;
+    SET @Recommended = N'Enabled';
+    SET @IsCompliant = CASE WHEN @IFIEnabled = 1 THEN 1 ELSE 0 END;
+    SET @Notes = CASE WHEN @IFIEnabled IS NULL THEN N'IFI status not available on this version.'
+                      WHEN @IsCompliant=1 THEN N'Instant File Initialization is enabled.'
+                      ELSE N'Enable IFI (Perform volume maintenance tasks privilege on SQL Server service account).' END;
+
+    UPDATE dbo.SQLBestPracticeMonitoring
+      SET Status = CASE WHEN @IsCompliant=1 THEN 'Resolved' ELSE 'Unresolved' END,
+          CurrentValue = @Current,
+          RecommendedValue = @Recommended,
+          Notes = @Notes,
+          LastChecked = GETDATE(),
+          ResolvedDate = CASE WHEN @IsCompliant=1 THEN GETDATE() ELSE ResolvedDate END
+    WHERE InstanceID = @InstanceID AND DBID = @DBID AND BestPracticeName = @BPName;
+
+    IF @@ROWCOUNT = 0 AND @IsCompliant = 0
+        INSERT dbo.SQLBestPracticeMonitoring
+            (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+        VALUES
+            (@InstanceID, @DBID, @InstanceName, @DBName, @BPName, @Current, @Recommended, 'Unresolved', @Notes);
+
+    -- Lock Pages In Memory
+    SET @DBID = 0; SET @DBName = N'InstanceLevel'; SET @BPName = N'LockPagesInMemory';
+    SET @Current = CASE WHEN @LPIMEnabled IS NULL THEN N'Unknown' ELSE CASE WHEN @LPIMEnabled=1 THEN N'Enabled' ELSE N'Disabled' END END;
+    SET @Recommended = N'Enabled (for dedicated SQL Servers)';
+    SET @IsCompliant = CASE WHEN @LPIMEnabled = 1 THEN 1 ELSE 0 END;
+    SET @Notes = CASE WHEN @LPIMEnabled IS NULL THEN N'LPIM status not available on this version.'
+                      WHEN @IsCompliant=1 THEN N'LPIM in effect (locked page allocations detected).'
+                      ELSE N'Consider enabling LPIM for dedicated SQL Servers.' END;
+
+    UPDATE dbo.SQLBestPracticeMonitoring
+      SET Status = CASE WHEN @IsCompliant=1 THEN 'Resolved' ELSE 'Unresolved' END,
+          CurrentValue = @Current,
+          RecommendedValue = @Recommended,
+          Notes = @Notes,
+          LastChecked = GETDATE(),
+          ResolvedDate = CASE WHEN @IsCompliant=1 THEN GETDATE() ELSE ResolvedDate END
+    WHERE InstanceID = @InstanceID AND DBID = @DBID AND BestPracticeName = @BPName;
+
+    IF @@ROWCOUNT = 0 AND @IsCompliant = 0
+        INSERT dbo.SQLBestPracticeMonitoring
+            (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+        VALUES
+            (@InstanceID, @DBID, @InstanceName, @DBName, @BPName, @Current, @Recommended, 'Unresolved', @Notes);
+
+    -- System Health XE session (modern default trace equivalent)
+    SET @DBID = 0; SET @DBName = N'InstanceLevel'; SET @BPName = N'SystemHealthXESession';
+    SET @Current = CASE WHEN @SystemHealthXE IS NULL THEN N'Unknown' ELSE CASE WHEN @SystemHealthXE=1 THEN N'Enabled' ELSE N'Disabled' END END;
+    SET @Recommended = N'Enabled';
+    SET @IsCompliant = CASE WHEN @SystemHealthXE = 1 THEN 1 ELSE 0 END;
+    SET @Notes = CASE WHEN @SystemHealthXE IS NULL THEN N'XE session status not available.'
+                      WHEN @IsCompliant=1 THEN N'system_health XE session is running.'
+                      ELSE N'Enable system_health XE session for basic diagnostics.' END;
+
+    UPDATE dbo.SQLBestPracticeMonitoring
+      SET Status = CASE WHEN @IsCompliant=1 THEN 'Resolved' ELSE 'Unresolved' END,
+          CurrentValue = @Current,
+          RecommendedValue = @Recommended,
+          Notes = @Notes,
+          LastChecked = GETDATE(),
+          ResolvedDate = CASE WHEN @IsCompliant=1 THEN GETDATE() ELSE ResolvedDate END
+    WHERE InstanceID = @InstanceID AND DBID = @DBID AND BestPracticeName = @BPName;
+
+    IF @@ROWCOUNT = 0 AND @IsCompliant = 0
+        INSERT dbo.SQLBestPracticeMonitoring
+            (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+        VALUES
+            (@InstanceID, @DBID, @InstanceName, @DBName, @BPName, @Current, @Recommended, 'Unresolved', @Notes);
+
+    -------------------------------------------------------------------------
+    -- Database-level checks (set-based) for user DBs only
+    -------------------------------------------------------------------------
+    BEGIN TRY
+        ;WITH dbs AS (
+            SELECT d.database_id AS DBID,
+                   d.name AS DBName,
+                   d.page_verify_option_desc,
+                   d.recovery_model_desc,
+                   d.is_auto_close_on,
+                   d.is_auto_shrink_on,
+                   d.is_read_committed_snapshot_on,
+                   d.compatibility_level,
+                   -- ADR (2019+); NULL when not present
+                   TRY_CAST(d.is_accelerated_database_recovery_on AS BIT) AS is_adr_on
+            FROM sys.databases AS d
+            WHERE d.database_id > 4 AND d.name NOT IN (N'master', N'model', N'msdb', N'tempdb')
+        )
+        -- Page Verify = CHECKSUM
+        UPDATE tgt
+          SET Status = CASE WHEN src.page_verify_option_desc = 'CHECKSUM' THEN 'Resolved' ELSE 'Unresolved' END,
+              CurrentValue = src.page_verify_option_desc,
+              RecommendedValue = 'CHECKSUM',
+              Notes = CASE WHEN src.page_verify_option_desc = 'CHECKSUM' THEN 'Page Verify is CHECKSUM.'
+                           ELSE 'Set Page Verify to CHECKSUM.' END,
+              LastChecked = GETDATE(),
+              ResolvedDate = CASE WHEN src.page_verify_option_desc = 'CHECKSUM' THEN GETDATE() ELSE tgt.ResolvedDate END
+        FROM dbo.SQLBestPracticeMonitoring tgt
+        JOIN dbs src ON src.DBID = tgt.DBID
+        WHERE tgt.InstanceID = @InstanceID AND tgt.BestPracticeName = 'PageVerify';
+
+        INSERT dbo.SQLBestPracticeMonitoring
+            (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+        SELECT @InstanceID, src.DBID, @InstanceName, src.DBName, 'PageVerify',
+               src.page_verify_option_desc, 'CHECKSUM', 'Unresolved', 'Set Page Verify to CHECKSUM.'
+        FROM dbs src
+        WHERE src.page_verify_option_desc <> 'CHECKSUM'
+          AND NOT EXISTS (SELECT 1 FROM dbo.SQLBestPracticeMonitoring t
+                          WHERE t.InstanceID=@InstanceID AND t.DBID=src.DBID AND t.BestPracticeName='PageVerify');
+
+        -- Recovery Model = FULL (may vary by environment)
+        UPDATE tgt
+          SET Status = CASE WHEN src.recovery_model_desc = 'FULL' THEN 'Resolved' ELSE 'Unresolved' END,
+              CurrentValue = src.recovery_model_desc,
+              RecommendedValue = 'FULL',
+              Notes = CASE WHEN src.recovery_model_desc = 'FULL' THEN 'Recovery Model is FULL.'
+                           ELSE 'Use FULL for production databases (ensure log backups).' END,
+              LastChecked = GETDATE(),
+              ResolvedDate = CASE WHEN src.recovery_model_desc = 'FULL' THEN GETDATE() ELSE tgt.ResolvedDate END
+        FROM dbo.SQLBestPracticeMonitoring tgt
+        JOIN dbs src ON src.DBID = tgt.DBID
+        WHERE tgt.InstanceID = @InstanceID AND tgt.BestPracticeName = 'RecoveryModel';
+
+        INSERT dbo.SQLBestPracticeMonitoring
+            (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+        SELECT @InstanceID, src.DBID, @InstanceName, src.DBName, 'RecoveryModel',
+               src.recovery_model_desc, 'FULL', 'Unresolved', 'Use FULL for production databases (ensure log backups).'
+        FROM dbs src
+        WHERE src.recovery_model_desc <> 'FULL'
+          AND NOT EXISTS (SELECT 1 FROM dbo.SQLBestPracticeMonitoring t
+                          WHERE t.InstanceID=@InstanceID AND t.DBID=src.DBID AND t.BestPracticeName='RecoveryModel');
+
+        -- Auto Close = OFF
+        UPDATE tgt
+          SET Status = CASE WHEN src.is_auto_close_on = 0 THEN 'Resolved' ELSE 'Unresolved' END,
+              CurrentValue = CASE WHEN src.is_auto_close_on = 0 THEN 'OFF' ELSE 'ON' END,
+              RecommendedValue = 'OFF',
+              Notes = CASE WHEN src.is_auto_close_on = 0 THEN 'AUTO_CLOSE is OFF.'
+                           ELSE 'Disable AUTO_CLOSE to avoid overhead.' END,
+              LastChecked = GETDATE(),
+              ResolvedDate = CASE WHEN src.is_auto_close_on = 0 THEN GETDATE() ELSE tgt.ResolvedDate END
+        FROM dbo.SQLBestPracticeMonitoring tgt
+        JOIN dbs src ON src.DBID = tgt.DBID
+        WHERE tgt.InstanceID = @InstanceID AND tgt.BestPracticeName = 'AutoClose';
+
+        INSERT dbo.SQLBestPracticeMonitoring
+            (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+        SELECT @InstanceID, src.DBID, @InstanceName, src.DBName, 'AutoClose',
+               'ON', 'OFF', 'Unresolved', 'Disable AUTO_CLOSE to avoid overhead.'
+        FROM dbs src
+        WHERE src.is_auto_close_on = 1
+          AND NOT EXISTS (SELECT 1 FROM dbo.SQLBestPracticeMonitoring t
+                          WHERE t.InstanceID=@InstanceID AND t.DBID=src.DBID AND t.BestPracticeName='AutoClose');
+
+        -- Auto Shrink = OFF
+        UPDATE tgt
+          SET Status = CASE WHEN src.is_auto_shrink_on = 0 THEN 'Resolved' ELSE 'Unresolved' END,
+              CurrentValue = CASE WHEN src.is_auto_shrink_on = 0 THEN 'OFF' ELSE 'ON' END,
+              RecommendedValue = 'OFF',
+              Notes = CASE WHEN src.is_auto_shrink_on = 0 THEN 'AUTO_SHRINK is OFF.'
+                           ELSE 'Disable AUTO_SHRINK; it causes fragmentation and overhead.' END,
+              LastChecked = GETDATE(),
+              ResolvedDate = CASE WHEN src.is_auto_shrink_on = 0 THEN GETDATE() ELSE tgt.ResolvedDate END
+        FROM dbo.SQLBestPracticeMonitoring tgt
+        JOIN dbs src ON src.DBID = tgt.DBID
+        WHERE tgt.InstanceID = @InstanceID AND tgt.BestPracticeName = 'AutoShrink';
+
+        INSERT dbo.SQLBestPracticeMonitoring
+            (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+        SELECT @InstanceID, src.DBID, @InstanceName, src.DBName, 'AutoShrink',
+               'ON', 'OFF', 'Unresolved', 'Disable AUTO_SHRINK; it causes fragmentation and overhead.'
+        FROM dbs src
+        WHERE src.is_auto_shrink_on = 1
+          AND NOT EXISTS (SELECT 1 FROM dbo.SQLBestPracticeMonitoring t
+                          WHERE t.InstanceID=@InstanceID AND t.DBID=src.DBID AND t.BestPracticeName='AutoShrink');
+
+        -- RCSI ON (configurable)
+        UPDATE tgt
+          SET Status = CASE WHEN src.is_read_committed_snapshot_on = 1 THEN 'Resolved' ELSE 'Unresolved' END,
+              CurrentValue = CASE WHEN src.is_read_committed_snapshot_on = 1 THEN 'ON' ELSE 'OFF' END,
+              RecommendedValue = 'ON',
+              Notes = CASE WHEN src.is_read_committed_snapshot_on = 1 THEN 'RCSI is ON.'
+                           ELSE 'Consider enabling RCSI to reduce blocking (validate workload).' END,
+              LastChecked = GETDATE(),
+              ResolvedDate = CASE WHEN src.is_read_committed_snapshot_on = 1 THEN GETDATE() ELSE tgt.ResolvedDate END
+        FROM dbo.SQLBestPracticeMonitoring tgt
+        JOIN dbs src ON src.DBID = tgt.DBID
+        WHERE tgt.InstanceID = @InstanceID AND tgt.BestPracticeName = 'RCSI';
+
+        INSERT dbo.SQLBestPracticeMonitoring
+            (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+        SELECT @InstanceID, src.DBID, @InstanceName, src.DBName, 'RCSI',
+               'OFF', 'ON', 'Unresolved', 'Consider enabling RCSI to reduce blocking (validate workload).'
+        FROM dbs src
+        WHERE src.is_read_committed_snapshot_on = 0
+          AND NOT EXISTS (SELECT 1 FROM dbo.SQLBestPracticeMonitoring t
+                          WHERE t.InstanceID=@InstanceID AND t.DBID=src.DBID AND t.BestPracticeName='RCSI');
+
+        -- ADR ON (2019+); skip if NULL/unsupported
+        UPDATE tgt
+          SET Status = CASE WHEN src.is_adr_on = 1 THEN 'Resolved' ELSE 'Unresolved' END,
+              CurrentValue = CASE WHEN src.is_adr_on = 1 THEN 'ON' ELSE 'OFF' END,
+              RecommendedValue = 'ON',
+              Notes = CASE WHEN src.is_adr_on = 1 THEN 'ADR is ON.'
+                           ELSE 'Enable Accelerated Database Recovery (2019+).' END,
+              LastChecked = GETDATE(),
+              ResolvedDate = CASE WHEN src.is_adr_on = 1 THEN GETDATE() ELSE tgt.ResolvedDate END
+        FROM dbo.SQLBestPracticeMonitoring tgt
+        JOIN dbs src ON src.DBID = tgt.DBID
+        WHERE tgt.InstanceID = @InstanceID AND tgt.BestPracticeName = 'ADR'
+          AND src.is_adr_on IS NOT NULL;
+
+        INSERT dbo.SQLBestPracticeMonitoring
+            (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+        SELECT @InstanceID, src.DBID, @InstanceName, src.DBName, 'ADR',
+               'OFF', 'ON', 'Unresolved', 'Enable Accelerated Database Recovery (2019+).'
+        FROM dbs src
+        WHERE src.is_adr_on = 0
+          AND src.is_adr_on IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM dbo.SQLBestPracticeMonitoring t
+                          WHERE t.InstanceID=@InstanceID AND t.DBID=src.DBID AND t.BestPracticeName='ADR');
+
+        -- Compatibility level: warn when 2 versions behind
+        UPDATE tgt
+          SET Status = CASE WHEN src.compatibility_level >= @LatestCompatLevel - @CompatWarnDelta THEN 'Resolved' ELSE 'Unresolved' END,
+              CurrentValue = CAST(src.compatibility_level AS NVARCHAR(10)),
+              RecommendedValue = CAST(@LatestCompatLevel AS NVARCHAR(10)),
+              Notes = CASE WHEN src.compatibility_level >= @LatestCompatLevel - @CompatWarnDelta
+                           THEN 'Compatibility level is acceptable.'
+                           ELSE 'Compatibility is behind; consider upgrading for new features/perf.' END,
+              LastChecked = GETDATE(),
+              ResolvedDate = CASE WHEN src.compatibility_level >= @LatestCompatLevel - @CompatWarnDelta THEN GETDATE() ELSE tgt.ResolvedDate END
+        FROM dbo.SQLBestPracticeMonitoring tgt
+        JOIN dbs src ON src.DBID = tgt.DBID
+        WHERE tgt.InstanceID = @InstanceID AND tgt.BestPracticeName = 'CompatibilityLevel';
+
+        INSERT dbo.SQLBestPracticeMonitoring
+            (InstanceID, DBID, InstanceName, DatabaseName, BestPracticeName, CurrentValue, RecommendedValue, Status, Notes)
+        SELECT @InstanceID, src.DBID, @InstanceName, src.DBName, 'CompatibilityLevel',
+               CAST(src.compatibility_level AS NVARCHAR(10)),
+               CAST(@LatestCompatLevel AS NVARCHAR(10)),
+               'Unresolved',
+               'Compatibility is behind; consider upgrading for new features/perf.'
+        FROM dbs src
+        WHERE src.compatibility_level < @LatestCompatLevel - @CompatWarnDelta
+          AND NOT EXISTS (SELECT 1 FROM dbo.SQLBestPracticeMonitoring t
+                          WHERE t.InstanceID=@InstanceID AND t.DBID=src.DBID AND t.BestPracticeName='CompatibilityLevel');
+
+    END TRY
+    BEGIN CATCH
+        INSERT INTO dbo.SQLBestPracticeMonitoringErrors
+            (InstanceID, DBID, DatabaseName, BestPracticeName, ErrorMessage, ErrorLine, LogTime)
+        VALUES
+            (@InstanceID, -1, N'Unknown', N'DatabaseLevel', ERROR_MESSAGE(), ERROR_LINE(), GETDATE());
+        INSERT INTO @DebugLog VALUES (N'Database-level Error: ' + ERROR_MESSAGE(), GETDATE());
+    END CATCH;
+
+    -------------------------------------------------------------------------
+    -- Output
+    -------------------------------------------------------------------------
+    SELECT * FROM @DebugLog ORDER BY LogTime ASC;
+
+    SELECT BestPracticeName, DatabaseName, Status, COUNT(*) AS IssueCount
+    FROM dbo.SQLBestPracticeMonitoring
+    WHERE Status = 'Unresolved'
+    GROUP BY BestPracticeName, DatabaseName, Status
+    ORDER BY BestPracticeName, DatabaseName;
+
+    PRINT 'SQL Best Practices Check Completed at ' + CONVERT(NVARCHAR(30), GETDATE(), 120);
+END
+GO
