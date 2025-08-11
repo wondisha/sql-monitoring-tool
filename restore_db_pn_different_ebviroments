@@ -1,0 +1,332 @@
+#requires -Modules dbatools
+<#
+.SYNOPSIS
+Refresh a database on a DEV Availability Group from backups and rejoin with Automatic seeding.
+
+.DESCRIPTION
+- Discovers primary/secondary in the specified AG via the listener.
+- Sets failover mode to Manual while operating.
+- Removes the DB from the AG (if present), drops it on the secondary (if exists).
+- Restores the DB on the primary from the provided backup path.
+- Ensures FULL recovery and adds the DB back to the AG with Automatic seeding.
+- Ensures AvailabilityMode is SynchronousCommit before enabling Automatic failover.
+- Supports -WhatIf and is idempotent.
+
+.PARAMETER DevListenerName
+AG listener used to discover replicas.
+
+.PARAMETER DevAGGroupName
+Availability Group name.
+
+.PARAMETER DBName
+Target database name.
+
+.PARAMETER BackupPath
+UNC or folder path containing the backup files (full + diffs/logs as needed).
+
+.PARAMETER FileMapping
+Hashtable mapping logical file names to new physical paths when restoring.
+
+.PARAMETER DestinationDataDir
+If FileMapping is omitted, place data files here.
+
+.PARAMETER DestinationLogDir
+If FileMapping is omitted, place log files here.
+
+.PARAMETER SecondaryReplicaName
+Optional: explicitly choose which secondary to pair for seeding.
+
+.PARAMETER SkipModeChanges
+If set, don’t change AvailabilityMode/FailoverMode, only perform DB refresh/join.
+
+.EXAMPLE
+.\Refresh-DevAgDatabase.ps1 -WhatIf
+.\Refresh-DevAgDatabase.ps1 -DevListenerName 'dveserv01' -DevAGGroupName 'AGdev01' -DBName 'db01' -BackupPath '\\sharedpath' -WhatIf
+#>
+
+[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
+param(
+    [string]$DevListenerName = 'dveserv01',
+    [string]$DevAGGroupName  = 'AGdev01',
+    [string]$DBName          = 'db01',
+    [string]$BackupPath      = '\\sharedpath',
+
+    # Use either FileMapping OR Destination* directories (FileMapping preferred).
+    [hashtable]$FileMapping = @{
+        'db01'     = 'd:\data\db01.mdf'
+        'db01_log' = 'd:\log\db01.ldf'
+    },
+    [string]$DestinationDataDir,
+    [string]$DestinationLogDir,
+
+    [string]$SecondaryReplicaName,
+    [int]$BlockSize = 8192,
+    [int]$SyncWaitSeconds = 120,
+
+    [switch]$SkipModeChanges
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+function Write-Step($msg) { Write-Host "==> $msg" -ForegroundColor Cyan }
+function Write-Info($msg) { Write-Host "    $msg" -ForegroundColor Gray }
+
+# Preflight
+try {
+    Import-Module dbatools -ErrorAction Stop
+} catch {
+    throw "The 'dbatools' module is required. Try: Install-Module dbatools -Scope CurrentUser"
+}
+
+if (-not $BackupPath) { throw "BackupPath is required." }
+if (-not (Test-Path -LiteralPath $BackupPath)) {
+    throw "BackupPath not accessible: $BackupPath"
+}
+
+Write-Step "Discovering replicas for AG '$DevAGGroupName' via listener '$DevListenerName'..."
+$devReplicas = Get-DbaAgReplica -SqlInstance $DevListenerName -AvailabilityGroup $DevAGGroupName
+if (-not $devReplicas) { throw "Availability Group '$DevAGGroupName' not found on $DevListenerName." }
+
+$devPrimaryNode   = ($devReplicas | Where-Object Role -eq 'Primary'   | Select-Object -First 1).Name
+$secondaryList    = ($devReplicas | Where-Object Role -eq 'Secondary').Name
+
+if (-not $devPrimaryNode) { throw "No Primary replica found for AG '$DevAGGroupName'." }
+if (-not $secondaryList -or $secondaryList.Count -eq 0) { throw "No Secondary replica found for AG '$DevAGGroupName'." }
+
+if ($SecondaryReplicaName) {
+    if ($secondaryList -notcontains $SecondaryReplicaName) {
+        throw "Specified SecondaryReplicaName '$SecondaryReplicaName' is not a secondary for AG '$DevAGGroupName'. Valid: $($secondaryList -join ', ')"
+    }
+    $devSecondaryNode = $SecondaryReplicaName
+} else {
+    $devSecondaryNode = $secondaryList | Select-Object -First 1
+}
+
+Write-Host "Primary:   $devPrimaryNode"
+Write-Host "Secondary: $devSecondaryNode"
+
+# Capture current modes
+$originalModes = Get-DbaAgReplica -SqlInstance $DevListenerName -AvailabilityGroup $DevAGGroupName |
+    Select-Object Name, AvailabilityMode, FailoverMode
+
+# Move to Manual during operation (unless skipped)
+if (-not $SkipModeChanges) {
+    Write-Step "Setting FailoverMode=Manual on both replicas..."
+    if ($PSCmdlet.ShouldProcess("$DevAGGroupName/$devSecondaryNode", "Set FailoverMode Manual")) {
+        Set-DbaAgReplica -SqlInstance $DevListenerName -AvailabilityGroup $DevAGGroupName -Replica $devSecondaryNode -FailoverMode Manual | Out-Null
+    }
+    if ($PSCmdlet.ShouldProcess("$DevAGGroupName/$devPrimaryNode", "Set FailoverMode Manual")) {
+        Set-DbaAgReplica -SqlInstance $DevListenerName -AvailabilityGroup $DevAGGroupName -Replica $devPrimaryNode  -FailoverMode Manual | Out-Null
+    }
+} else {
+    Write-Info "SkipModeChanges is set. Leaving replica modes unchanged."
+}
+
+# Remove DB from AG if present
+Write-Step "Removing database '$DBName' from AG (if present)..."
+$agDb = Get-DbaAgDatabase -SqlInstance $devPrimaryNode -AvailabilityGroup $DevAGGroupName -ErrorAction SilentlyContinue |
+        Where-Object DatabaseName -eq $DBName
+if ($agDb) {
+    if ($PSCmdlet.ShouldProcess("$devPrimaryNode/$DBName", "Remove from AG '$DevAGGroupName'")) {
+        Remove-DbaAgDatabase -SqlInstance $devPrimaryNode -AvailabilityGroup $DevAGGroupName -Database $DBName -Confirm:$false | Out-Null
+    }
+} else {
+    Write-Info "Database is not currently joined to the AG on primary."
+}
+
+# Drop DB on secondary if it exists
+Write-Step "Dropping database '$DBName' on secondary (if exists)..."
+$secondaryDb = Get-DbaDatabase -SqlInstance $devSecondaryNode -Database $DBName -ErrorAction SilentlyContinue
+if ($secondaryDb) {
+    if ($PSCmdlet.ShouldProcess("$devSecondaryNode/$DBName", "Drop database")) {
+        Remove-DbaDatabase -SqlInstance $devSecondaryNode -Database $DBName -Confirm:$false | Out-Null
+    }
+} else {
+    Write-Info "Database not found on secondary."
+}
+
+# Restore DB on primary
+Write-Step "Restoring '$DBName' on primary from '$BackupPath'..."
+$restoreParams = @{
+    SqlInstance   = $devPrimaryNode
+    DatabaseName  = $DBName
+    Path          = $BackupPath
+    WithReplace   = $true
+    BlockSize     = $BlockSize
+    OutputScriptOnly = $false
+}
+if ($FileMapping -and $FileMapping.Count -gt 0) {
+    $restoreParams['FileMapping'] = $FileMapping
+} else {
+    if ($DestinationDataDir) { $restoreParams['DestinationDataDirectory'] = $DestinationDataDir }
+    if ($DestinationLogDir)  { $restoreParams['DestinationLogDirectory']  = $DestinationLogDir  }
+}
+
+if ($PSCmdlet.ShouldProcess("$devPrimaryNode/$DBName", "Restore from backups")) {
+    Restore-DbaDatabase @restoreParams | Out-Null
+}
+
+# Ensure FULL recovery
+Write-Step "Ensuring recovery model FULL on primary..."
+Invoke-DbaQuery -SqlInstance $devPrimaryNode -Query @"
+IF DB_ID(N'$DBName') IS NOT NULL
+BEGIN
+    IF (SELECT recovery_model_desc FROM sys.databases WHERE name = N'$DBName') <> 'FULL'
+        ALTER DATABASE [$DBName] SET RECOVERY FULL WITH NO_WAIT;
+END
+"@ | Out-Null
+
+# Add DB back to AG with Automatic seeding
+Write-Step "Adding '$DBName' to AG '$DevAGGroupName' with Automatic seeding..."
+if ($PSCmdlet.ShouldProcess("$devPrimaryNode/$DBName", "Add-DbaAgDatabase (Automatic seeding) to $devSecondaryNode")) {
+    Add-DbaAgDatabase -SqlInstance $devPrimaryNode -AvailabilityGroup $DevAGGroupName -Database $DBName -Secondary $devSecondaryNode -SeedingMode Automatic | Out-Null
+}
+
+# If allowed, ensure AvailabilityMode and Automatic failover
+if (-not $SkipModeChanges) {
+    Write-Step "Ensuring AvailabilityMode=SynchronousCommit before enabling Automatic failover..."
+    $current = Get-DbaAgReplica -SqlInstance $DevListenerName -AvailabilityGroup $DevAGGroupName |
+               Select-Object Name, AvailabilityMode, FailoverMode
+
+    foreach ($rep in $current) {
+        if ($rep.AvailabilityMode -ne 'SynchronousCommit') {
+            if ($PSCmdlet.ShouldProcess("$DevAGGroupName/$($rep.Name)", "Set AvailabilityMode SynchronousCommit")) {
+                Set-DbaAgReplica -SqlInstance $DevListenerName -AvailabilityGroup $DevAGGroupName -Replica $rep.Name -AvailabilityMode SynchronousCommit | Out-Null
+            }
+        }
+    }
+
+    Write-Step "Setting FailoverMode=Automatic on both replicas..."
+    if ($PSCmdlet.ShouldProcess("$DevAGGroupName/$devSecondaryNode", "Set FailoverMode Automatic")) {
+        Set-DbaAgReplica -SqlInstance $DevListenerName -AvailabilityGroup $DevAGGroupName -Replica $devSecondaryNode -FailoverMode Automatic | Out-Null
+    }
+    if ($PSCmdlet.ShouldProcess("$DevAGGroupName/$devPrimaryNode", "Set FailoverMode Automatic")) {
+        Set-DbaAgReplica -SqlInstance $DevListenerName -AvailabilityGroup $DevAGGroupName -Replica $devPrimaryNode  -FailoverMode Automatic | Out-Null
+    }
+}
+
+# Wait for synchronization (best-effort)
+Write-Step "Waiting up to $SyncWaitSeconds seconds for synchronization..."
+$deadline = (Get-Date).AddSeconds($SyncWaitSeconds)
+$syncState = 'Unknown'
+while ((Get-Date) -lt $deadline) {
+    try {
+        $rs = Invoke-DbaQuery -SqlInstance $devSecondaryNode -Query @"
+SELECT TOP 1 s.synchronization_state_desc
+FROM sys.dm_hadr_database_replica_states s
+JOIN sys.databases d ON d.database_id = s.database_id
+WHERE d.name = N'$DBName'
+"@ -ErrorAction Stop
+        if ($rs) {
+            $state = $rs[0].synchronization_state_desc
+            if ($state) { $syncState = $state }
+            if ($syncState -eq 'SYNCHRONIZED') { break }
+        }
+    } catch {
+        # secondary may not be ready momentarily; retry
+    }
+    Start-Sleep -Seconds 2
+}
+
+# Summary
+Write-Step "Summary"
+$finalPrimary    = Get-DbaAgDatabase -SqlInstance $devPrimaryNode   -AvailabilityGroup $DevAGGroupName -Database $DBName -ErrorAction SilentlyContinue
+$finalSecondary  = Get-DbaAgDatabase -SqlInstance $devSecondaryNode -AvailabilityGroup $DevAGGroupName -Database $DBName -ErrorAction SilentlyContinue
+$replicaModesNow = Get-DbaAgReplica -SqlInstance $DevListenerName -AvailabilityGroup $DevAGGroupName | Select-Object Name, AvailabilityMode, FailoverMode
+
+[pscustomobject]@{
+    PrimaryNode                  = $devPrimaryNode
+    SecondaryNode                = $devSecondaryNode
+    JoinedOnPrimary              = [bool]$finalPrimary
+    JoinedOnSecondary            = [bool]$finalSecondary
+    SynchronizationStateSecondary= $syncState
+    ReplicasAvailabilityFailover = $replicaModesNow
+} | Format-List
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+[CmdletBinding()]
+param(
+  [string]$SourceShare      = '\\proddb01\path',            # PROD share
+  [string]$DestinationShare = '\\commonshare\sqlbackups\db01', # Common share DEV can read
+  [string]$Database         = 'db01',                       # DB name prefix in file names
+  [switch]$IncludeLogBackups = $true,                       # Include *.trn
+  [int]$RetryCount = 3,                                     # robocopy /R
+  [int]$RetryWaitSeconds = 5,                               # robocopy /W
+  [string]$LogFile = 'C:\dba\logs\Sync-DbBackups_db01.log', # Local log on the agent machine
+  [int]$RetentionDays = 0                                   # >0 to delete older files at destination
+)
+
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+
+# Ensure destination and log folder exist
+New-Item -ItemType Directory -Path $DestinationShare -Force | Out-Null
+$logDir = Split-Path -Parent $LogFile
+if ($logDir) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
+
+# Build file masks (adjust if you have a strict naming convention)
+$fileMasks = @("$Database*.bak")
+if ($IncludeLogBackups) { $fileMasks += "$Database*.trn" }
+
+# Build robocopy args
+$roboArgs = @(
+  $SourceShare
+  $DestinationShare
+) + $fileMasks + @(
+  "/Z",                     # restartable mode
+  "/FFT",                   # FAT time tolerance (cross-share)
+  "/R:$RetryCount",         # retries
+  "/W:$RetryWaitSeconds",   # wait between retries (sec)
+  "/XO",                    # exclude older
+  "/XN",                    # exclude newer (keeps dest newer files)
+  "/NP", "/NFL", "/NDL", "/NJH", "/NJS",  # quiet logging to console
+  "/LOG+:$LogFile"          # append to log file
+)
+
+Write-Host "Running: robocopy $SourceShare $DestinationShare $($fileMasks -join ' ') ..."
+$null = & robocopy @roboArgs
+$rc = $LASTEXITCODE
+
+# Robocopy return codes: 0–7 are success/info, >=8 are errors
+if ($rc -ge 8) {
+  throw "Robocopy failed with exit code $rc. See log: $LogFile"
+} else {
+  Write-Host "Robocopy completed with exit code $rc (success/info). See log: $LogFile"
+}
+
+# Optional retention cleanup at destination (disabled by default)
+if ($RetentionDays -gt 0) {
+  $cutoff = (Get-Date).AddDays(-$RetentionDays)
+  Write-Host "Pruning destination files older than $RetentionDays days (before $cutoff)..."
+  foreach ($mask in $fileMasks) {
+    Get-ChildItem -LiteralPath $DestinationShare -Filter $mask -File -ErrorAction SilentlyContinue |
+      Where-Object { $_.LastWriteTime -lt $cutoff } |
+      Remove-Item -Force -ErrorAction SilentlyContinue
+  }
+  Write-Host "Retention cleanup done."
+}
+
+
+
+# Copy full + log backups for db01
+pwsh -NoProfile -File C:\dba\Sync-DbBackups.ps1 `
+  -SourceShare '\\proddb01\path' `
+  -DestinationShare '\\commonshare\sqlbackups\db01' `
+  -Database 'db01' `
+  -IncludeLogBackups `
+  -LogFile 'C:\dba\logs\Sync-DbBackups_db01.log'
