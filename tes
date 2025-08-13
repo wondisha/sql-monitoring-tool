@@ -1,54 +1,59 @@
 // ...existing code...
-
 function Get-ServerListFromDB {
+    [CmdletBinding()]
     param (
         [string]$Server,
         [string]$Database,
-        [string]$Schema = 'dbo',
-        [string]$Table  = 'ServerName',
-        [string]$Column = 'ServerName'
+        [string]$Schema,
+        [string]$Table,
+        [string]$Column
     )
 
-    # Simple identifier guard (letters, digits, underscore)
-    $valid = '^[A-Za-z0-9_]+$'
-    foreach ($n in @($Schema,$Table,$Column)) {
-        if ($n -notmatch $valid) { throw "Invalid identifier: $n" }
-    }
-
-    $fq  = "[{0}].[{1}]" -f $Schema,$Table
-    $col = "[{0}]" -f $Column
-    $query = @"
-IF OBJECT_ID(N'$fq', N'U') IS NULL
-    THROW 50000, 'SQLGuardian: Table $fq not found.', 1;
-SELECT $col AS ServerName FROM $fq;
-"@
-
     try {
-        Write-Log "Attempting to retrieve server list from $Server.$Database using $fq..." "INFO"
-        $rows = Invoke-Sqlcmd -ServerInstance $Server -Database $Database -Query $query -TrustServerCertificate -ErrorAction Stop
-        Write-Log "Successfully retrieved server list from $Server.$Database." "INFO"
-        return $rows | Select-Object -ExpandProperty ServerName
-    } catch {
-        try {
-            # Suggest tables that have a ServerName column
-            $probe = Invoke-Sqlcmd -ServerInstance $Server -Database $Database -TrustServerCertificate -ErrorAction Stop -Query @"
-SELECT s.name AS SchemaName, t.name AS TableName
+        if ($Schema -and $Table -and $Column) {
+            $fq  = "[{0}].[{1}]" -f $Schema, $Table
+            $col = "[{0}]" -f $Column
+            $query = "SELECT $col AS ServerName FROM $fq;"
+        } else {
+            $discoverQuery = @"
+SELECT TOP 1 s.name AS SchemaName, t.name AS TableName, c.name AS ColumnName
 FROM sys.tables t
 JOIN sys.schemas s ON s.schema_id = t.schema_id
-WHERE EXISTS (
-  SELECT 1 FROM sys.columns c WHERE c.object_id = t.object_id AND c.name = 'ServerName'
-)
-ORDER BY s.name, t.name;
+JOIN sys.columns c ON c.object_id = t.object_id
+WHERE c.name IN (N'ServerName',N'servername',N'Server',N'server',N'InstanceName',N'Host',N'HostName')
+ORDER BY CASE WHEN c.name IN (N'ServerName',N'servername') THEN 0 ELSE 1 END,
+         t.create_date DESC;
+"@
+            $cand = Invoke-Sqlcmd -ServerInstance $Server -Database $Database -Query $discoverQuery -TrustServerCertificate -ErrorAction Stop
+            if (-not $cand) { throw "No table with a 'ServerName'-like column found." }
+            $fq  = "[{0}].[{1}]" -f $cand[0].SchemaName, $cand[0].TableName
+            $col = "[{0}]" -f $cand[0].ColumnName
+            $query = "SELECT $col AS ServerName FROM $fq;"
+            Write-Log "Auto-selected $fq.$col for server list." "INFO"
+        }
+
+        Write-Log "Retrieving server list from $Server.$Database ($fq)..." "INFO"
+        $rows = Invoke-Sqlcmd -ServerInstance $Server -Database $Database -Query $query -TrustServerCertificate -ErrorAction Stop
+        $list = $rows | ForEach-Object { "$($_.ServerName)".Trim() } | Where-Object { $_ } | Select-Object -Unique
+        if (-not $list) { throw "Query returned no servers." }
+        return $list
+    } catch {
+        Write-Log "ERROR: Failed to retrieve server list from $Server.$Database. $($_.Exception.Message). Falling back." "ERROR"
+        try {
+            $probe = Invoke-Sqlcmd -ServerInstance $Server -Database $Database -TrustServerCertificate -ErrorAction Stop -Query @"
+SELECT s.name+'.'+t.name AS TableName, c.name AS ColumnName
+FROM sys.tables t
+JOIN sys.schemas s ON s.schema_id = t.schema_id
+JOIN sys.columns c ON c.object_id = t.object_id
+WHERE c.name LIKE '%Server%'
+ORDER BY 1, 2;
 "@
             if ($probe) {
-                $suggest = ($probe | ForEach-Object { "$($_.SchemaName).$($_.TableName)" } | Select-Object -Unique) -join ', '
-                Write-Log "Hint: Found candidate tables with a 'ServerName' column: $suggest" "WARN"
+                $hint = ($probe | Select-Object -First 5 | ForEach-Object { "$($_.TableName)[$($_.ColumnName)]" }) -join ', '
+                Write-Log "Hint: Candidate sources -> $hint" "WARN"
             }
         } catch {}
-
-        Write-Log "ERROR: Failed to retrieve server list from $Server.$Database. $($_.Exception.Message). Falling back to defaults." "ERROR"
         return @('techpc','Server2','Server3')
     }
 }
-
 // ...existing code...
