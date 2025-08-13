@@ -1,0 +1,54 @@
+// ...existing code...
+
+function Get-ServerListFromDB {
+    param (
+        [string]$Server,
+        [string]$Database,
+        [string]$Schema = 'dbo',
+        [string]$Table  = 'ServerName',
+        [string]$Column = 'ServerName'
+    )
+
+    # Simple identifier guard (letters, digits, underscore)
+    $valid = '^[A-Za-z0-9_]+$'
+    foreach ($n in @($Schema,$Table,$Column)) {
+        if ($n -notmatch $valid) { throw "Invalid identifier: $n" }
+    }
+
+    $fq  = "[{0}].[{1}]" -f $Schema,$Table
+    $col = "[{0}]" -f $Column
+    $query = @"
+IF OBJECT_ID(N'$fq', N'U') IS NULL
+    THROW 50000, 'SQLGuardian: Table $fq not found.', 1;
+SELECT $col AS ServerName FROM $fq;
+"@
+
+    try {
+        Write-Log "Attempting to retrieve server list from $Server.$Database using $fq..." "INFO"
+        $rows = Invoke-Sqlcmd -ServerInstance $Server -Database $Database -Query $query -TrustServerCertificate -ErrorAction Stop
+        Write-Log "Successfully retrieved server list from $Server.$Database." "INFO"
+        return $rows | Select-Object -ExpandProperty ServerName
+    } catch {
+        try {
+            # Suggest tables that have a ServerName column
+            $probe = Invoke-Sqlcmd -ServerInstance $Server -Database $Database -TrustServerCertificate -ErrorAction Stop -Query @"
+SELECT s.name AS SchemaName, t.name AS TableName
+FROM sys.tables t
+JOIN sys.schemas s ON s.schema_id = t.schema_id
+WHERE EXISTS (
+  SELECT 1 FROM sys.columns c WHERE c.object_id = t.object_id AND c.name = 'ServerName'
+)
+ORDER BY s.name, t.name;
+"@
+            if ($probe) {
+                $suggest = ($probe | ForEach-Object { "$($_.SchemaName).$($_.TableName)" } | Select-Object -Unique) -join ', '
+                Write-Log "Hint: Found candidate tables with a 'ServerName' column: $suggest" "WARN"
+            }
+        } catch {}
+
+        Write-Log "ERROR: Failed to retrieve server list from $Server.$Database. $($_.Exception.Message). Falling back to defaults." "ERROR"
+        return @('techpc','Server2','Server3')
+    }
+}
+
+// ...existing code...
