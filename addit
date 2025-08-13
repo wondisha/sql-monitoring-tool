@@ -1,0 +1,60 @@
+// ...existing code...
+function Invoke-MonitoringDbSql {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]$Query,
+        [System.Collections.IDictionary]$Variables
+    )
+
+    $serverTcp = if ($Config.ContainsKey('MonitoringDBPort') -and $Config.MonitoringDBPort) {
+        "tcp:$($Config.MonitoringDBServer),$($Config.MonitoringDBPort)"
+    } else {
+        "tcp:$($Config.MonitoringDBServer)"
+    }
+
+    $tries = @($serverTcp, $Config.MonitoringDBServer) # try TCP first, then original value
+    foreach ($svr in $tries) {
+        for ($i=1; $i -le 2; $i++) {
+            try {
+                return Invoke-Sqlcmd -ServerInstance $svr `
+                    -Database $Config.MonitoringDBName `
+                    -Query $Query `
+                    -Variable $Variables `
+                    -ConnectionTimeout 5 `
+                    -TrustServerCertificate `
+                    -ErrorAction Stop
+            } catch {
+                if ($i -eq 2) {
+                    Write-Log "Monitoring DB attempt $i to '$svr' failed: $($_.Exception.Message)" "ERROR"
+                } else {
+                    Start-Sleep -Seconds 1
+                }
+            }
+        }
+    }
+    throw "All connection attempts to Monitoring DB failed. Server=$($Config.MonitoringDBServer), Port=$($Config['MonitoringDBPort'])"
+}
+// ...existing code...
+
+
+// ...existing code...
+function Insert-AlertToDB {
+    param (
+        [string]$ServerName,
+        [string]$AlertLevel,
+        [string]$AlertCategory,
+        [string]$Message
+    )
+    $query = "INSERT INTO [dbo].[Alerts] (ServerName, AlertLevel, AlertCategory, Message) VALUES (@ServerName, @AlertLevel, @AlertCategory, @Message);"
+    try {
+        Invoke-MonitoringDbSql -Query $query -Variables @{
+            ServerName   = $ServerName
+            AlertLevel   = $AlertLevel
+            AlertCategory= $AlertCategory
+            Message      = $Message
+        } | Out-Null
+    } catch {
+        Write-Log "ERROR: Failed to insert alert to Monitoring DB. Error: $($_.Exception.Message)" "ERROR"
+    }
+}
+// ...existing code...
