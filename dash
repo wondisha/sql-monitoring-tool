@@ -1,0 +1,1080 @@
+from datetime import datetime, timedelta
+import logging
+from typing import Optional
+
+import altair as alt
+import pandas as pd
+import streamlit as st
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+class Config:
+    """Configuration constants for the dashboard."""
+
+    DEFAULT_QUERY_TIME_RANGE = 24
+    DEFAULT_WAREHOUSE_TIME_RANGE = 7
+    DEFAULT_STORAGE_TIME_RANGE = 15
+    DEFAULT_TASK_TIME_RANGE = 7
+    CACHE_TTL = 600  # 10 minutes
+    MAX_QUERIES_DISPLAY = 100
+    BYTES_TO_GB = 1024 ** 3
+    MS_TO_SECONDS = 1000
+
+
+# --- Enhanced Data Fetching Functions ---
+
+# Reusable field name constant for Altair charts
+TIME_FIELD = "START_TIME:T"
+
+
+@st.cache_data(ttl=Config.CACHE_TTL)
+def get_query_history_and_insights(time_range_hours: int = 24) -> pd.DataFrame:
+    """Fetch query history and related insights from Snowflake.
+
+    Returns a cleaned DataFrame with numeric casts and helpful derived
+    columns like BYTES_SCANNED_GB and QUERY_TEXT_PREVIEW.
+    """
+
+    end_time = datetime.now()
+    start_time = end_time - timedelta(hours=time_range_hours)
+
+    query = f"""
+    WITH query_execution_counts AS (
+        SELECT
+            query_text,
+            COUNT(*) AS query_execution_count
+                FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY
+                WHERE start_time >= '{start_time.isoformat()}'
+                    AND start_time <= '{end_time.isoformat()}'
+        GROUP BY query_text
+    ),
+    filtered_queries AS (
+        SELECT
+            qh.query_id,
+            qh.query_text,
+            qh.user_name,
+            qh.warehouse_name,
+            qh.start_time AS query_execution_time,
+            qh.total_elapsed_time / {Config.MS_TO_SECONDS}
+            AS execution_time_seconds,
+            qh.bytes_scanned,
+            qh.partitions_scanned,
+            qh.partitions_total,
+            qi.insight_type_id,
+            qi.message,
+            qi.suggestions,
+            qh.execution_status,
+            qh.role_name,
+            qh.compilation_time / {Config.MS_TO_SECONDS}
+            AS compilation_time_sec,
+            qh.rows_produced,
+            qh.error_code,
+            qh.error_message,
+            CASE
+                WHEN qh.partitions_total > 0 THEN
+                    qh.partitions_scanned / qh.partitions_total
+                ELSE 0
+            END AS partition_scan_ratio
+                FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY qh
+                LEFT JOIN SNOWFLAKE.ACCOUNT_USAGE.QUERY_INSIGHTS qi
+                        ON qi.query_id = qh.query_id
+                WHERE qh.start_time >= '{start_time.isoformat()}'
+                    AND qh.start_time <= '{end_time.isoformat()}'
+                    AND (
+                qh.total_elapsed_time > 3600000 -- > 1 hour
+                OR qi.insight_type_id IS NOT NULL
+                OR qh.bytes_scanned > 1000000000 -- > 1GB
+                OR (qh.partitions_total > 0
+                    AND qh.partitions_scanned / qh.partitions_total > 0.8)
+                OR qh.execution_status = 'FAILED'
+            )
+    )
+    SELECT
+        fq.*,
+        COALESCE(qec.query_execution_count, 1) AS query_execution_count
+    FROM filtered_queries fq
+    LEFT JOIN query_execution_counts qec ON fq.query_text = qec.query_text
+    ORDER BY fq.execution_time_seconds DESC
+    LIMIT {Config.MAX_QUERIES_DISPLAY};
+    """
+
+    try:
+        df = st.connection("snowflake").query(query)
+
+        # Optimize data types
+        numeric_cols = [
+            "EXECUTION_TIME_SECONDS",
+            "BYTES_SCANNED",
+            "PARTITIONS_SCANNED",
+            "PARTITIONS_TOTAL",
+            "QUERY_EXECUTION_COUNT",
+            "COMPILATION_TIME_SEC",
+            "ROWS_PRODUCED",
+            "PARTITION_SCAN_RATIO",
+        ]
+
+        for col in numeric_cols:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+        if "QUERY_EXECUTION_TIME" in df.columns:
+            df["QUERY_EXECUTION_TIME"] = pd.to_datetime(
+                df["QUERY_EXECUTION_TIME"], errors="coerce"
+            )
+
+        # Add calculated columns
+        if "BYTES_SCANNED" in df.columns:
+            df["BYTES_SCANNED_GB"] = df["BYTES_SCANNED"] / Config.BYTES_TO_GB
+        else:
+            df["BYTES_SCANNED_GB"] = 0
+
+        if "QUERY_TEXT" in df.columns:
+            df["QUERY_TEXT_PREVIEW"] = (
+                df["QUERY_TEXT"].astype(str).str[:100] + "..."
+            )
+        else:
+            df["QUERY_TEXT_PREVIEW"] = ""
+
+        return df
+
+    except (RuntimeError, OSError, ValueError, TypeError) as exc:
+        logger.exception("Error fetching query history: %s", exc)
+        st.error("Error fetching query history. See logs for details.")
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=Config.CACHE_TTL)
+def get_warehouse_metering_history(time_range_days: int = 7) -> pd.DataFrame:
+    """Fetch warehouse metering history and coerce numeric columns."""
+
+    end_time = datetime.now()
+    start_time = end_time - timedelta(days=time_range_days)
+
+    query = f"""
+    SELECT
+        START_TIME,
+        END_TIME,
+        WAREHOUSE_ID,
+        WAREHOUSE_NAME,
+        CREDITS_USED,
+        CREDITS_USED_COMPUTE,
+        CREDITS_USED_CLOUD_SERVICES,
+        CREDITS_USED / NULLIF(DATEDIFF(hour, START_TIME, END_TIME), 0)
+            AS credits_per_hour
+    FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY
+    WHERE START_TIME >= '{start_time.isoformat()}'
+      AND END_TIME <= '{end_time.isoformat()}'
+    ORDER BY START_TIME ASC;
+    """
+
+    try:
+        df = st.connection("snowflake").query(query)
+        numeric_cols = [
+            "CREDITS_USED",
+            "CREDITS_USED_COMPUTE",
+            "CREDITS_USED_CLOUD_SERVICES",
+            "CREDITS_PER_HOUR",
+        ]
+
+        for col in numeric_cols:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+        return df
+
+    except (RuntimeError, OSError, ValueError, TypeError) as exc:
+        logger.exception(
+            "Error fetching warehouse metering history: %s", exc
+        )
+        st.error(
+            "Error fetching warehouse metering history. "
+            "See logs for details."
+        )
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=Config.CACHE_TTL)
+def get_login_history(time_range_days: int = 7) -> pd.DataFrame:
+    """Fetch login history and extract useful time information."""
+
+    end_time = datetime.now()
+    start_time = end_time - timedelta(days=time_range_days)
+
+    query = f"""
+    SELECT
+        EVENT_TIMESTAMP,
+        USER_NAME,
+        CLIENT_IP,
+        REPORTED_CLIENT_TYPE,
+        REPORTED_CLIENT_VERSION,
+        FIRST_AUTHENTICATION_FACTOR,
+        SECOND_AUTHENTICATION_FACTOR,
+        IS_SUCCESS,
+        EXTRACT(hour FROM EVENT_TIMESTAMP) AS login_hour
+    FROM SNOWFLAKE.ACCOUNT_USAGE.LOGIN_HISTORY
+    WHERE EVENT_TIMESTAMP >= '{start_time.isoformat()}'
+      AND EVENT_TIMESTAMP <= '{end_time.isoformat()}'
+    ORDER BY EVENT_TIMESTAMP DESC;
+    """
+
+    try:
+        df = st.connection("snowflake").query(query)
+        if "EVENT_TIMESTAMP" in df.columns:
+            df["EVENT_TIMESTAMP"] = pd.to_datetime(
+                df["EVENT_TIMESTAMP"], errors="coerce"
+            )
+        return df
+
+    except (RuntimeError, OSError, ValueError, TypeError) as exc:
+        logger.exception("Error fetching login history: %s", exc)
+        st.error("Error fetching login history. See logs for details.")
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=Config.CACHE_TTL)
+def get_database_storage_usage_history(
+    time_range_days: int = 30,
+) -> pd.DataFrame:
+    """Fetch database storage history and convert bytes to GB."""
+
+    end_time = datetime.now()
+    start_time = end_time - timedelta(days=time_range_days)
+
+    query = f"""
+    SELECT
+        USAGE_DATE,
+        DATABASE_NAME,
+        AVERAGE_DATABASE_BYTES / {Config.BYTES_TO_GB} AS AVERAGE_DATABASE_GB,
+        AVERAGE_FAILSAFE_BYTES / {Config.BYTES_TO_GB} AS AVERAGE_FAILSAFE_GB,
+        (
+            AVERAGE_DATABASE_BYTES + AVERAGE_FAILSAFE_BYTES
+        ) / {Config.BYTES_TO_GB} AS TOTAL_STORAGE_GB
+    FROM SNOWFLAKE.ACCOUNT_USAGE.DATABASE_STORAGE_USAGE_HISTORY
+    WHERE USAGE_DATE >= '{start_time.date().isoformat()}'
+      AND USAGE_DATE <= '{end_time.date().isoformat()}'
+    ORDER BY USAGE_DATE ASC;
+    """
+
+    try:
+        df = st.connection("snowflake").query(query)
+        numeric_cols = [
+            "AVERAGE_DATABASE_GB",
+            "AVERAGE_FAILSAFE_GB",
+            "TOTAL_STORAGE_GB",
+        ]
+
+        for col in numeric_cols:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+        return df
+
+    except (RuntimeError, OSError, ValueError, TypeError) as exc:
+        logger.exception(
+            "Error fetching database storage usage history: %s", exc
+        )
+        st.error(
+            "Error fetching database storage usage history. "
+            "See logs for details."
+        )
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=Config.CACHE_TTL)
+def get_task_history(time_range_days: int = 7) -> pd.DataFrame:
+    """Fetch task history and compute duration in seconds."""
+
+    end_time = datetime.now()
+    start_time = end_time - timedelta(days=time_range_days)
+
+    query = f"""
+    SELECT
+        QUERY_ID,
+        NAME,
+        STATE,
+        SCHEDULED_TIME,
+        COMPLETED_TIME,
+        ERROR_CODE,
+        ERROR_MESSAGE,
+        DATABASE_NAME,
+        SCHEMA_NAME,
+        RETURN_VALUE,
+        RUN_ID,
+        TIMEDIFF(second, SCHEDULED_TIME, COMPLETED_TIME) AS DURATION_SECONDS,
+        EXTRACT(hour FROM SCHEDULED_TIME) AS scheduled_hour
+    FROM SNOWFLAKE.ACCOUNT_USAGE.TASK_HISTORY
+    WHERE SCHEDULED_TIME >= '{start_time.isoformat()}'
+      AND SCHEDULED_TIME <= '{end_time.isoformat()}'
+    ORDER BY SCHEDULED_TIME DESC;
+    """
+
+    try:
+        df = st.connection("snowflake").query(query)
+        if "DURATION_SECONDS" in df.columns:
+            df["DURATION_SECONDS"] = (
+                pd.to_numeric(
+                    df["DURATION_SECONDS"], errors="coerce"
+                ).fillna(0)
+            )
+        return df
+
+    except (RuntimeError, OSError, ValueError, TypeError) as exc:
+        logger.exception("Error fetching task history: %s", exc)
+        st.error("Error fetching task history. See logs for details.")
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=Config.CACHE_TTL)
+def get_query_acceleration_eligible() -> pd.DataFrame:
+    """Fetch queries eligible for query acceleration with estimated savings."""
+
+    query = """
+    WITH acceleration_potential AS (
+        SELECT
+            qae.query_id,
+            LEFT(qae.query_text, 200) AS query_text_preview,
+            qae.warehouse_name,
+            qae.eligible_query_acceleration_time / 1000
+            AS eligible_acceleration_seconds,
+            qae.start_time,
+            (
+                qae.eligible_query_acceleration_time / 3600000.0
+            ) AS potential_time_saved_hours
+        FROM snowflake.account_usage.query_acceleration_eligible qae
+        WHERE qae.start_time >= DATEADD(day, -7, CURRENT_TIMESTAMP())
+    )
+    SELECT
+        query_id,
+        query_text_preview,
+        warehouse_name,
+        eligible_acceleration_seconds,
+        potential_time_saved_hours,
+        start_time
+    FROM acceleration_potential
+    ORDER BY potential_time_saved_hours DESC
+    LIMIT 20;
+    """
+
+    try:
+        df = st.connection("snowflake").query(query)
+        numeric_cols = [
+            "ELIGIBLE_ACCELERATION_SECONDS",
+            "POTENTIAL_TIME_SAVED_HOURS",
+        ]
+
+        for col in numeric_cols:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+        return df
+
+    except (RuntimeError, OSError, ValueError, TypeError) as exc:
+        logger.exception(
+            "Error fetching query acceleration data: %s", exc
+        )
+        st.error(
+            "Error fetching query acceleration data. "
+            "See logs for details."
+        )
+        return pd.DataFrame()
+
+
+# --- Utility Functions ---
+
+def format_bytes(bytes_val: float) -> str:
+    """Return a human readable byte string for a numeric byte value."""
+
+    if bytes_val == 0:
+        return "0 B"
+
+    units = ["B", "KB", "MB", "GB", "TB"]
+    unit_idx = 0
+
+    while bytes_val >= 1024 and unit_idx < len(units) - 1:
+        bytes_val /= 1024
+        unit_idx += 1
+
+    return f"{bytes_val:.2f} {units[unit_idx]}"
+
+
+def create_metric_card(
+    title: str, value: str, delta: Optional[str] = None
+) -> None:
+    """Render a Streamlit metric card."""
+
+    st.metric(label=title, value=value, delta=delta)
+
+
+def safe_divide(
+    numerator: float, denominator: float, default: float = 0.0
+) -> float:
+    """Safely divide two numbers.
+
+    Returns the default value when the denominator is zero.
+    """
+
+    return numerator / denominator if denominator != 0 else default
+
+
+def detect_credit_anomalies(
+    df: pd.DataFrame, threshold_factor: float = 2.0
+) -> pd.DataFrame:
+    """Detect hourly credit spikes using a rolling mean/std approach."""
+
+    if df.empty:
+        return pd.DataFrame()
+
+    df["START_TIME_HOUR"] = pd.to_datetime(df["START_TIME"]).dt.floor("H")
+    hourly_credits = (
+        df.groupby("START_TIME_HOUR")["CREDITS_USED"].sum().reset_index()
+    )
+
+    hourly_credits["CREDITS_ROLLING_MEAN"] = (
+        hourly_credits["CREDITS_USED"].rolling(window=24, min_periods=1).mean()
+    )
+
+    hourly_credits["CREDITS_ROLLING_STD"] = (
+        hourly_credits["CREDITS_USED"].rolling(window=24, min_periods=1).std()
+    )
+
+    hourly_credits["ANOMALY_THRESHOLD"] = (
+        hourly_credits["CREDITS_ROLLING_MEAN"]
+        + threshold_factor * hourly_credits["CREDITS_ROLLING_STD"]
+    )
+
+    anomalies = hourly_credits[
+        hourly_credits["CREDITS_USED"] > hourly_credits["ANOMALY_THRESHOLD"]
+    ].copy()
+    anomalies["ANOMALY_TYPE"] = "Credit Spike"
+    return anomalies
+
+
+# --- Enhanced Visualization Functions ---
+
+def create_warehouse_utilization_chart(df: pd.DataFrame) -> alt.Chart:
+    """Create an Altair chart for compute vs cloud services credit usage.
+
+    Uses .interactive() to enable zoom/pan instead of the deprecated
+    .add_selection API.
+    """
+
+    if df.empty:
+        return alt.Chart().mark_text(text="No data available")
+
+    # Allow user interactions (pan/zoom)
+    base = alt.Chart(df).interactive()
+
+    compute_line = base.mark_line(color="blue", strokeWidth=2).encode(
+        x=alt.X(TIME_FIELD, title="Time"),
+        y=alt.Y("CREDITS_USED_COMPUTE:Q", title="Credits Used"),
+        tooltip=[
+            alt.Tooltip(TIME_FIELD, format="%Y-%m-%d %H:%M"),
+            "WAREHOUSE_NAME:N",
+            "CREDITS_USED_COMPUTE:Q",
+        ],
+    )
+
+    cloud_services_line = base.mark_line(
+        color="orange", strokeDash=[5, 5], strokeWidth=2
+    ).encode(
+        x=TIME_FIELD,
+        y="CREDITS_USED_CLOUD_SERVICES:Q",
+        tooltip=[
+            alt.Tooltip(TIME_FIELD, format="%Y-%m-%d %H:%M"),
+            "WAREHOUSE_NAME:N",
+            "CREDITS_USED_CLOUD_SERVICES:Q",
+        ],
+    )
+
+    return (compute_line + cloud_services_line).resolve_scale(y="independent")
+
+
+# --- Main Streamlit App ---
+
+def main() -> None:  # noqa: C901
+    """Render the Streamlit dashboard UI and wire data fetchers."""
+
+    st.set_page_config(
+        layout="wide",
+        page_title="Snowflake Health Check Dashboard",
+        page_icon="❄️",
+        initial_sidebar_state="expanded",
+    )
+
+    st.title("❄️ Snowflake Health Check Dashboard")
+    st.markdown("---")
+
+    # Enhanced Sidebar
+    with st.sidebar:
+        st.header("🔧 Configuration")
+
+        if st.button("🔄 Clear Cache & Refresh"):
+            st.cache_data.clear()
+            st.cache_resource.clear()
+            st.rerun()
+
+        st.subheader("Time Range Filters")
+
+        query_time_range = st.slider(
+            "Query Analysis (Hours)",
+            min_value=1,
+            max_value=168,
+            value=Config.DEFAULT_QUERY_TIME_RANGE,
+        )
+
+        warehouse_time_range = st.slider(
+            "Warehouse Usage (Days)",
+            min_value=1,
+            max_value=30,
+            value=Config.DEFAULT_WAREHOUSE_TIME_RANGE,
+        )
+
+        storage_time_range = st.slider(
+            "Storage Analysis (Days)",
+            min_value=7,
+            max_value=90,
+            value=Config.DEFAULT_STORAGE_TIME_RANGE,
+        )
+
+        task_time_range = st.slider(
+            "Task History (Days)",
+            min_value=1,
+            max_value=30,
+            value=Config.DEFAULT_TASK_TIME_RANGE,
+        )
+
+        st.subheader("Cost Configuration")
+        credit_cost = st.number_input(
+            "Cost per Credit ($)", min_value=0.01, value=2.00, step=0.10
+        )
+
+    # Data Loading with Progress Indicator
+    with st.spinner("🔄 Loading data from Snowflake..."):
+        progress_bar = st.progress(0)
+
+        # Load data with progress tracking
+        query_df = get_query_history_and_insights(query_time_range)
+        progress_bar.progress(15)
+
+        warehouse_df = get_warehouse_metering_history(warehouse_time_range)
+        progress_bar.progress(30)
+
+        login_df = get_login_history(warehouse_time_range)
+        progress_bar.progress(45)
+
+        storage_df = get_database_storage_usage_history(storage_time_range)
+        progress_bar.progress(60)
+
+        task_df = get_task_history(task_time_range)
+        progress_bar.progress(75)
+
+        query_acceleration_df = get_query_acceleration_eligible()
+        progress_bar.progress(100)
+
+    st.success("✅ Data loaded successfully!")
+
+    # Enhanced Role Filter
+    if not query_df.empty:
+        all_roles = ["All"] + sorted(
+            query_df["ROLE_NAME"].dropna().unique().tolist()
+        )
+        selected_role = st.sidebar.selectbox("🔐 Filter by Role", all_roles)
+
+        if selected_role != "All":
+            query_df = query_df[query_df["ROLE_NAME"] == selected_role]
+
+    # Enhanced Tab Structure
+    tab_names = [
+        "📊 Overview",
+        "⏱️ Long Running Queries",
+        "💰 Resource Utilization",
+        "💡 Query Insights",
+        "💾 Storage Usage",
+        "🤖 Tasks & Automation",
+        "🔐 Security & Access",
+        "🚀 Query Acceleration",
+    ]
+
+    tabs = st.tabs(tab_names)
+
+    # Enhanced Overview Tab
+    with tabs[0]:
+        st.header("📊 System Health Overview")
+
+        if not query_df.empty:
+            col1, col2, col3, col4 = st.columns(4)
+
+            total_queries = len(query_df)
+            successful_queries = len(
+                query_df[query_df["EXECUTION_STATUS"] == "SUCCESS"]
+            )
+            failed_queries = len(
+                query_df[query_df["EXECUTION_STATUS"] == "FAILED"]
+            )
+            avg_exec_time = query_df["EXECUTION_TIME_SECONDS"].mean()
+
+            with col1:
+                create_metric_card(
+                    "Total Analyzed Queries", f"{total_queries:,}"
+                )
+            with col2:
+                success_rate = (
+                    safe_divide(successful_queries, total_queries) * 100
+                )
+                create_metric_card("Success Rate", f"{success_rate:.1f}%")
+            with col3:
+                create_metric_card("Failed Queries", f"{failed_queries:,}")
+            with col4:
+                create_metric_card(
+                    "Avg. Execution Time", f"{avg_exec_time:.1f}s"
+                )
+
+            # Additional metrics in a second row
+            col5, col6, col7, col8 = st.columns(4)
+
+            if not warehouse_df.empty:
+                total_credits = warehouse_df["CREDITS_USED"].sum()
+                total_cost = total_credits * credit_cost
+                avg_credits_per_hour = warehouse_df["CREDITS_PER_HOUR"].mean()
+
+                with col5:
+                    create_metric_card(
+                        "Total Credits Used", f"{total_credits:.2f}"
+                    )
+                with col6:
+                    create_metric_card(
+                        "Est. Total Cost", f"${total_cost:,.2f}"
+                    )
+                with col7:
+                    create_metric_card(
+                        "Avg Credits / Hour", f"{avg_credits_per_hour:.2f}"
+                    )
+
+            if not storage_df.empty:
+                current_storage = storage_df["TOTAL_STORAGE_GB"].max()
+                with col8:
+                    create_metric_card(
+                        "Current Storage", f"{current_storage:.1f} GB"
+                    )
+
+            if not task_df.empty:
+                # Placeholder for task-related metrics; implemented elsewhere
+                pass
+
+            # Quick Health Indicators
+            st.subheader("🎯 Health Indicators")
+
+            health_col1, health_col2, health_col3 = st.columns(3)
+
+            with health_col1:
+                if success_rate >= 95:
+                    st.success(
+                        (
+                            "✅ Query Success Rate: "
+                            f"{success_rate:.1f}% (Excellent)"
+                        )
+                    )
+                elif success_rate >= 90:
+                    st.warning(
+                        (
+                            "⚠️ Query Success Rate: "
+                            f"{success_rate:.1f}% (Good)"
+                        )
+                    )
+                else:
+                    st.error(
+                        (
+                            "❌ Query Success Rate: "
+                            f"{success_rate:.1f}% (Needs Attention)"
+                        )
+                    )
+
+            with health_col2:
+                long_queries = len(
+                    query_df[query_df["EXECUTION_TIME_SECONDS"] > 3600]
+                )
+                if long_queries == 0:
+                    st.success("✅ No extremely long queries (>1h)")
+                elif long_queries <= 5:
+                    st.warning(f"⚠️ {long_queries} long queries detected")
+                else:
+                    st.error(
+                        f"❌ {long_queries} long queries need optimization"
+                    )
+
+            with health_col3:
+                if not warehouse_df.empty:
+                    peak_credits = warehouse_df["CREDITS_PER_HOUR"].max()
+                    if peak_credits <= 10:
+                        st.success(
+                            f"✅ Peak usage: {peak_credits:.1f} credits/hour"
+                        )
+                    elif peak_credits <= 50:
+                        st.warning(
+                            f"⚠️ Peak usage: {peak_credits:.1f} credits/hour"
+                        )
+                    else:
+                        st.error(
+                            f"❌ High peak usage: {peak_credits:.1f} "
+                            "credits/hour"
+                        )
+        else:
+            st.info(
+                "🔍 No data available. Check your connection and permissions."
+            )
+
+    # Enhanced Long Running Queries Tab
+    with tabs[1]:
+        st.header("⏱️ Long Running Query Analysis")
+
+        if not query_df.empty:
+            col1, col2 = st.columns([2, 1])
+
+            with col1:
+                min_exec_time = st.slider(
+                    "Minimum Execution Time (seconds)",
+                    min_value=0,
+                    max_value=(
+                        int(query_df["EXECUTION_TIME_SECONDS"].max()) + 1
+                    ),
+                    value=300,
+                    step=60,
+                )
+
+            with col2:
+                show_failed_only = st.checkbox("Show only failed queries")
+
+            # Filter data
+            filtered_df = (
+                query_df[query_df["EXECUTION_TIME_SECONDS"] >= min_exec_time]
+            )
+
+            if show_failed_only:
+                filtered_df = filtered_df[
+                    filtered_df["EXECUTION_STATUS"] == "FAILED"
+                ]
+
+            if not filtered_df.empty:
+                st.subheader(
+                    f"📋 Found {len(filtered_df)} queries matching criteria"
+                )
+
+                # Display optimized columns
+                display_columns = [
+                    "QUERY_ID",
+                    "QUERY_TEXT_PREVIEW",
+                    "USER_NAME",
+                    "WAREHOUSE_NAME",
+                    "EXECUTION_TIME_SECONDS",
+                    "BYTES_SCANNED_GB",
+                    "PARTITION_SCAN_RATIO",
+                    "QUERY_EXECUTION_TIME",
+                    "EXECUTION_STATUS",
+                    "INSIGHT_TYPE_ID",
+                ]
+
+                available_columns = [col for col in display_columns
+                                     if col in filtered_df.columns]
+
+                st.dataframe(
+                    filtered_df[available_columns],
+                    use_container_width=True,
+                    height=400,
+                )
+
+                # Export option
+                csv = filtered_df.to_csv(index=False)
+                st.download_button(
+                    label="📥 Download Results as CSV",
+                    data=csv,
+                    file_name=(
+                        "long_running_queries_"
+                        + datetime.now().strftime("%Y%m%d_%H%M%S")
+                        + ".csv"
+                    ),
+                    mime="text/csv",
+                )
+
+            else:
+                st.info("✅ No queries found matching the specified criteria.")
+        else:
+            st.info("🔍 No query data available.")
+
+    # Enhanced Resource Utilization Tab
+    with tabs[2]:
+        st.header("💰 Resource Utilization Analysis")
+
+        if not warehouse_df.empty:
+            st.subheader("📈 Credit Usage Trends")
+
+            # Warehouse filter
+            warehouse_options = ["All"] + sorted(
+                warehouse_df["WAREHOUSE_NAME"].unique().tolist()
+            )
+
+            selected_warehouse = st.selectbox(
+                "Select Warehouse",
+                warehouse_options,
+            )
+
+            filtered_warehouse_df = warehouse_df
+            if selected_warehouse != "All":
+                filtered_warehouse_df = warehouse_df[
+                    warehouse_df["WAREHOUSE_NAME"] == selected_warehouse
+                ]
+
+            if not filtered_warehouse_df.empty:
+                # Enhanced visualization
+                chart = (
+                    create_warehouse_utilization_chart(filtered_warehouse_df)
+                )
+                st.altair_chart(chart, use_container_width=True)
+
+                # Credit usage summary
+                st.subheader("💳 Credit Usage Summary")
+                warehouse_summary = (
+                    filtered_warehouse_df.groupby("WAREHOUSE_NAME").agg(
+                        {
+                            "CREDITS_USED": "sum",
+                            "CREDITS_USED_COMPUTE": "sum",
+                            "CREDITS_USED_CLOUD_SERVICES": "sum",
+                            "CREDITS_PER_HOUR": "mean",
+                        }
+                    )
+                    .round(2)
+                    .reset_index()
+                )
+
+                st.dataframe(warehouse_summary, use_container_width=True)
+            else:
+                st.info("No warehouse data available for selected filters.")
+
+        # Query resource consumption
+        if not query_df.empty:
+            st.subheader("🔍 Top Resource Consuming Queries")
+            top_consumers = query_df.nlargest(10, "BYTES_SCANNED_GB")
+
+            if not top_consumers.empty:
+                display_cols = [
+                    "QUERY_TEXT_PREVIEW",
+                    "USER_NAME",
+                    "WAREHOUSE_NAME",
+                    "BYTES_SCANNED_GB",
+                    "EXECUTION_TIME_SECONDS",
+                    "PARTITION_SCAN_RATIO",
+                ]
+                available_cols = [
+                    col for col in display_cols if col in top_consumers.columns
+                ]
+
+                st.dataframe(
+                    top_consumers[available_cols], use_container_width=True
+                )
+
+    # New Query Insights Tab
+    with tabs[3]:
+        st.header("💡 Query Insights & Optimization Opportunities")
+
+        if not query_df.empty:
+            st.subheader("⚠️ Queries with Insights from Snowflake")
+            insight_queries = query_df[query_df["INSIGHT_TYPE_ID"].notna()]
+
+            if not insight_queries.empty:
+                st.write(
+                    (
+                        "These queries have performance insights from "
+                        "Snowflake."
+                    )
+                )
+                display_cols = [
+                    "QUERY_TEXT_PREVIEW",
+                    "USER_NAME",
+                    "EXECUTION_TIME_SECONDS",
+                    "INSIGHT_TYPE_ID",
+                    "MESSAGE",
+                    "SUGGESTIONS",
+                ]
+                st.dataframe(
+                    insight_queries[display_cols], use_container_width=True
+                )
+            else:
+                st.info(
+                    "✅ No queries with specific insights found in the "
+                    "selected time range."
+                )
+
+            st.markdown("---")
+            st.subheader("❌ Failed Queries and Error Messages")
+            failed_queries_df = query_df[
+                query_df["EXECUTION_STATUS"] == "FAILED"
+            ]
+
+            if not failed_queries_df.empty:
+                st.error(
+                    "The following queries failed to execute. Investigate the "
+                    "error messages to identify the cause."
+                )
+                failed_display_cols = [
+                    "QUERY_ID",
+                    "QUERY_TEXT_PREVIEW",
+                    "USER_NAME",
+                    "ERROR_MESSAGE",
+                    "ERROR_CODE",
+                ]
+                st.dataframe(
+                    failed_queries_df[failed_display_cols],
+                    use_container_width=True,
+                )
+            else:
+                st.success(
+                    "✅ No failed queries found in the selected "
+                    "time range."
+                )
+
+            st.markdown("---")
+            st.subheader("📈 Compilation vs. Execution Time")
+            query_time_df = query_df[
+                [
+                    "QUERY_ID",
+                    "COMPILATION_TIME_SEC",
+                    "EXECUTION_TIME_SECONDS",
+                ]
+            ].dropna()
+
+            if not query_time_df.empty:
+                chart = (
+                    alt.Chart(query_time_df)
+                    .mark_bar()
+                    .encode(
+                        x=alt.X("QUERY_ID:N", title="Query ID", sort="-y"),
+                        y=alt.Y("value:Q", title="Time (seconds)"),
+                        color=alt.Color("variable:N", title="Time Type"),
+                        tooltip=[
+                            alt.Tooltip("QUERY_ID:N"),
+                            alt.Tooltip("variable:N", title="Time Type"),
+                            alt.Tooltip("value:Q", title="Time (seconds)"),
+                        ],
+                    )
+                    .transform_fold(
+                        ["COMPILATION_TIME_SEC", "EXECUTION_TIME_SECONDS"],
+                        as_=["variable", "value"],
+                    )
+                )
+                st.altair_chart(chart, use_container_width=True)
+            else:
+                st.info("No data available for time breakdown analysis.")
+
+    # Storage Usage Tab
+    with tabs[4]:
+        st.header("💾 Storage Usage Analysis")
+        if not storage_df.empty:
+            st.subheader("📊 Storage Usage by Date")
+            storage_chart = (
+                alt.Chart(storage_df)
+                .mark_area(opacity=0.4)
+                .encode(
+                    x=alt.X("USAGE_DATE:T", title="Date"),
+                    y=alt.Y("TOTAL_STORAGE_GB:Q", title="Total Storage (GB)"),
+                    tooltip=["USAGE_DATE:T", "TOTAL_STORAGE_GB:Q"],
+                )
+                .properties(title="Historical Storage Usage")
+            )
+            st.altair_chart(storage_chart, use_container_width=True)
+
+            st.subheader("Summary Table")
+            st.dataframe(
+                storage_df.groupby("DATABASE_NAME")
+                .agg({
+                    "TOTAL_STORAGE_GB": "max",
+                    "AVERAGE_FAILSAFE_GB": "max",
+                })
+                .round(2)
+                .sort_values(by="TOTAL_STORAGE_GB", ascending=False),
+                use_container_width=True,
+            )
+        else:
+            st.info("No storage data available.")
+
+    # Tasks & Automation Tab
+    with tabs[5]:
+        st.header("🤖 Task & Automation Monitoring")
+        if not task_df.empty:
+            st.subheader("Failed Task History")
+            failed_tasks = task_df[task_df["STATE"] == "FAILED"]
+            if not failed_tasks.empty:
+                st.error(
+                    "❌ The following tasks have failed. Review the "
+                    "error messages."
+                )
+                st.dataframe(
+                    failed_tasks[["NAME", "SCHEDULED_TIME", "ERROR_MESSAGE"]],
+                    use_container_width=True,
+                )
+            else:
+                st.success(
+                    "✅ No failed tasks found in the selected "
+                    "time range."
+                )
+
+            st.subheader("Task Duration Trends")
+            st.write(
+                "Analyze average task duration over time to spot "
+                "performance degradation."
+            )
+
+    # Security & Access Tab
+    with tabs[6]:
+        st.header("🔐 Security & Access Insights")
+        if not login_df.empty:
+            st.subheader("Failed Login Attempts")
+            # Use boolean-safe filtering to avoid singleton comparison issues
+            failed_logins = login_df[~login_df["IS_SUCCESS"].astype(bool)]
+            if not failed_logins.empty:
+                st.warning(
+                    "⚠️ The following users or IPs had failed login "
+                    "attempts."
+                )
+                failed_login_summary = (
+                    failed_logins
+                    .groupby(["USER_NAME", "CLIENT_IP"])  # type: ignore
+                    .size()
+                    .reset_index(name="FAILED_ATTEMPTS")
+                )
+                st.dataframe(
+                    failed_login_summary.sort_values(
+                        "FAILED_ATTEMPTS", ascending=False
+                    ),
+                    use_container_width=True,
+                )
+            else:
+                st.success("✅ No failed login attempts found.")
+
+    # Query Acceleration Tab
+    with tabs[7]:
+        st.header("🚀 Query Acceleration Opportunities")
+        if not query_acceleration_df.empty:
+            st.info(
+                "Queries in this section are candidates for using the "
+                "Query Acceleration Service."
+            )
+            st.subheader("Top Queries by Potential Time Saved")
+            st.dataframe(query_acceleration_df, use_container_width=True)
+        else:
+            st.info(
+                "No queries eligible for acceleration were found in the "
+                "last 7 days."
+            )
+
+    # Add information footer
+    st.markdown("---")
+    st.info(
+        f"🔄 Data cached for {Config.CACHE_TTL//60} minutes | "
+        f"Last refreshed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+
+
+if __name__ == "__main__":
+    main()
