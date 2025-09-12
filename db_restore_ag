@@ -1,0 +1,109 @@
+# --- Configuration ---
+# Source network path where backups are stored (e.g., from PROD)
+$SourceBackupPath = '\\<shared-drive>\SQLBackups\'
+# Shared network path where TDE certificate and private key are stored
+$SourceCertificatePath = '\\<shared-cert-path>'
+# Local destination drive path on the DEV server for copied backups
+$LocalRestorePath = 'D:\LocalBackups\'
+# The database to restore
+$DatabaseName = 'db01'
+# The Dev SQL Server Instance Name (Secondary Replica)
+$DevServerInstance = 'DEV-SQL-SERVER'
+# The Availability Group name
+$AGName = 'YourAGName'
+# The TDE certificate name on the dev server. This must match the name on the prod server.
+$TdeCertName = 'db01-TDE-Cert'
+# The TDE certificate password
+$TdeCertPassword = 'YourStrongPasswordHere'
+# The Dev server's Master Key password (if it needs to be created)
+$DevMasterKeyPassword = 'YourDevMasterPassword'
+
+# --- Script Logic ---
+
+Write-Host "--- Starting Backup Copy and Restore Process ---"
+
+## Section 1: AG Pre-Restore: Remove Database from Secondary Replica ##
+Write-Host "`n--- Section 1: AG Pre-Restore ---"
+try {
+    # Remove the database from the AG on the secondary replica to allow for the restore
+    Write-Host "Removing database '$DatabaseName' from AG '$AGName' on secondary replica '$DevServerInstance'..."
+    Remove-DbaAgDatabase -SqlInstance $DevServerInstance -Database $DatabaseName -AvailabilityGroup $AGName -ErrorAction Stop
+    Write-Host "Database successfully removed from AG."
+} catch {
+    Write-Host "WARNING: Failed to remove database from AG. It may not have been part of an AG or an error occurred. Continuing with restore." -ForegroundColor Yellow
+}
+
+## Section 2: Copy Backups from Shared to Local Drive ##
+Write-Host "`n--- Section 2: Copying Backups to Local Drive ---"
+# Ensure the local destination directory exists
+if (-not (Test-Path $LocalRestorePath)) {
+    Write-Host "Creating local destination directory: $LocalRestorePath"
+    New-Item -ItemType Directory -Path $LocalRestorePath -Force | Out-Null
+}
+
+try {
+    Write-Host "Copying TDE certificate and private key..."
+    Copy-Item -Path "$SourceCertificatePath\$TdeCertName.cer" -Destination $LocalRestorePath -Force -ErrorAction Stop
+    Copy-Item -Path "$SourceCertificatePath\$TdeCertName.pvk" -Destination $LocalRestorePath -Force -ErrorAction Stop
+
+    Write-Host "Identifying and copying latest database backups..."
+    $latestFull = Get-ChildItem -Path $SourceBackupPath -Filter "$DatabaseName*_FULL_*.bak" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if (-not $latestFull) { throw "No Full backup found. Aborting." }
+    $latestDiff = Get-ChildItem -Path $SourceBackupPath -Filter "$DatabaseName*_DIFF_*.bak" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    $tlogBackups = Get-ChildItem -Path $SourceBackupPath -Filter "$DatabaseName*_LOG_*.bak" | Where-Object { $_.LastWriteTime -gt $latestFull.LastWriteTime } | Sort-Object LastWriteTime
+
+    $filesToCopy = @($latestFull)
+    if ($latestDiff) { $filesToCopy += $latestDiff }
+    $filesToCopy += $tlogBackups
+
+    foreach ($file in $filesToCopy) {
+        Write-Host "Copying $($file.Name)..."
+        Copy-Item -Path $file.FullName -Destination $LocalRestorePath -Force -ErrorAction Stop
+    }
+
+    Write-Host "All required backup files copied."
+} catch {
+    Write-Host "ERROR: File copy failed: $_. Exiting." -ForegroundColor Red
+    exit 1
+}
+
+## Section 3: Restore Database on Development Server ##
+Write-Host "`n--- Section 3: Restoring Database on $DevServerInstance ---"
+try {
+    # Prepare the list of backup files for dbatools Restore-DbaDatabase
+    $backupFilesForRestore = @(
+        "$LocalRestorePath\$($latestFull.Name)"
+    )
+    if ($latestDiff) { $backupFilesForRestore += "$LocalRestorePath\$($latestDiff.Name)" }
+    foreach ($log in $tlogBackups) { $backupFilesForRestore += "$LocalRestorePath\$($log.Name)" }
+
+    # Perform the restore using Restore-DbaDatabase
+    Restore-DbaDatabase -SqlInstance $DevServerInstance `
+        -Path $backupFilesForRestore `
+        -DatabaseName $DatabaseName `
+        -ReplaceExisting `
+        -RestoreTdeCertificate `
+        -CertificatePath "$LocalRestorePath\$TdeCertName.cer" `
+        -CertificatePassword $TdeCertPassword `
+        -DevMasterKeyPassword $DevMasterKeyPassword `
+        -ErrorAction Stop
+
+    Write-Host "Database restore completed successfully!"
+} catch {
+    Write-Host "ERROR: Database restore failed: $_. Exiting." -ForegroundColor Red
+    exit 1
+}
+
+## Section 4: AG Post-Restore: Re-add Database to Secondary Replica ##
+Write-Host "`n--- Section 4: AG Post-Restore ---"
+try {
+    # Re-add the restored database to the Availability Group
+    Write-Host "Adding database '$DatabaseName' back to AG '$AGName'..."
+    Add-DbaAgDatabase -SqlInstance $DevServerInstance -Database $DatabaseName -AvailabilityGroup $AGName -ErrorAction Stop
+    Write-Host "Database successfully re-added to AG."
+} catch {
+    Write-Host "ERROR: Failed to re-add database to AG: $_. Check the AG Dashboard for more details." -ForegroundColor Red
+    exit 1
+}
+
+Write-Host "`n--- Process Complete ---"
